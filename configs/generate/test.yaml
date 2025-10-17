@@ -1,7 +1,7 @@
 parameters:
   dataset_name: "yfcc100m"              # Name of the dataset to process
   model_name: "GeoCLIP"               # Name of the model (e.g., GeoCLIP, ResNet, etc.)
-  transform_name: "default"           # Name of the transform to use
+  transform_name: "geoclip"           # Name of the transform to use
   max_shards: null                    # Max shards to load (null for all)
   batch_size: 32                      # Batch size for inference
   num_workers: 4                      # Number of dataloader workers per GPU
