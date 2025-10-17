@@ -2,6 +2,7 @@ from torchvision import transforms
 from typing import Optional
 
 def get_pretrained_transform(model_name: str): 
+    model_name = model_name.lower()
     if model_name == "geoclip":
         return transforms.Compose([
             transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -17,6 +18,7 @@ def get_pretrained_transform(model_name: str):
 
 
 def get_transform(model_name: Optional[str] = None, mode: str = "train"):
+    model_name = model_name.lower()
     if model_name is not None:
         return get_pretrained_transform(model_name)
     else:
