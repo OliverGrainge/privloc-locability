@@ -2,181 +2,250 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from utils import load_config_yaml 
-from data.generate import load_dataset
+from data.datasets import load_dataset
 from models.transforms import get_transform
 from torch.utils.data import DataLoader, Subset
 from models.geolocation import load_model
-import pandas as pd 
 import sys
 import os 
 import torch
 import time 
 import ray
-import numpy as np
+import pandas as pd
+import logging
+from pathlib import Path
+import socket
+import shutil
+
+
+# Configure logging for SLURM cluster (single node, multi-GPU)
+def setup_logging(log_dir="logs", log_level=logging.INFO):
+    """
+    Setup logging configuration for SLURM single-node job
+    All logs go to one file + console (SLURM output)
+    """
+    # Create log directory if it doesn't exist
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get job info from SLURM environment variables
+    job_id = os.environ.get('SLURM_JOB_ID', 'local')
+    
+    # Setup logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(log_level)
+    
+    # Prevent duplicate handlers
+    if logger.handlers:
+        return logger
+    
+    # Console handler (goes to SLURM output file: slurm-<jobid>.out)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+    
+    # File handler (single unified log file for the job)
+    log_file = log_path / f"job_{job_id}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    logger.info(f"Logging to: {log_file}")
+    
+    return logger
+
+
+def setup_ray_actor_logging(actor_name, log_dir="logs", log_level=logging.INFO):
+    """
+    Setup logging for Ray actors (single node, different GPUs)
+    All actors log to the same file with their name prefixed
+    """
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    
+    job_id = os.environ.get('SLURM_JOB_ID', 'local')
+    
+    logger = logging.getLogger(actor_name)
+    logger.setLevel(log_level)
+    logger.handlers.clear()  # Clear any existing handlers
+    
+    # Console handler (goes to SLURM output)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_formatter = logging.Formatter(
+        f'%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+    
+    # File handler (shared log file for all actors)
+    log_file = log_path / f"job_{job_id}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(console_formatter)
+    
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+
+logger = setup_logging()
 
 
 @ray.remote
-class ResultCollector:
-    """Collects and periodically saves results from workers"""
+class ParquetWriter:
+    """Handles writing predictions to sharded Parquet files"""
     
-    def __init__(self, config, initial_df, output_path, save_interval=100):
-        self.config = config
-        self.df = initial_df
-        self.output_path = output_path
+    def __init__(self, output_dir, dataset_name, model_name, save_interval=100, 
+                 shard_size=100, log_dir="logs"):
+        self.output_dir = Path(output_dir)
+        self.dataset_name = dataset_name
+        self.model_name = model_name
         self.save_interval = save_interval
+        self.shard_size = shard_size  # Number of samples per shard
         self.batch_count = 0
+        self.total_samples_written = 0
+        self.current_shard = 0
+        self.samples_in_current_shard = 0
+        
+        # Setup logger for this actor first
+        self.logger = setup_ray_actor_logging("ParquetWriter", log_dir)
+        
+        # Create shard directory: output_dir/dataset_name_model_name/
+        self.shard_dir = self.output_dir / f"{dataset_name}_{model_name}"
+        
+        # Clean up existing shard directory if it exists (for clean restarts)
+        if self.shard_dir.exists():
+            self.logger.info(f"Cleaning up existing shard directory: {self.shard_dir}")
+            shutil.rmtree(self.shard_dir)
+        
+        self.shard_dir.mkdir(parents=True, exist_ok=True)
+        
         self.pending_results = []
+        
+        self.logger.info(f"Initialized with shard_size={shard_size}, shard_dir={self.shard_dir}")
+        self.logger.info("Ready to start generating predictions with sharding enabled")
         
     def add_results(self, batch_results):
         """Add batch results and save periodically"""
-        self.pending_results.append(batch_results)
+        batch_size = len(batch_results)
+        self.pending_results.extend(batch_results)
         self.batch_count += 1
+        self.total_samples_written += batch_size
         
-        # Save every N batches
+        # Check if we need to flush to current shard
+        if self.samples_in_current_shard + len(self.pending_results) >= self.shard_size:
+            self._flush_to_current_shard()
+        
+        # Save every N batches (for checkpointing)
         if self.batch_count % self.save_interval == 0:
-            self._merge_and_save()
-            return True  # Indicate a save occurred
+            self.logger.info(f"Checkpoint - Batch {self.batch_count}, Total samples: {self.total_samples_written}")
+            return True
         return False
     
-    def _merge_and_save(self):
-        """Merge pending results and save to disk"""
+    def _get_current_shard_path(self):
+        """Get the path for the current shard file"""
+        return self.shard_dir / f"part_{self.current_shard:03d}.parquet"
+    
+    def _flush_to_current_shard(self):
+        """Write pending results to current shard file"""
         if not self.pending_results:
             return
         
-        parameters = self.config.parameters
-        model_lat = f"{parameters.model_name.lower()}_lat"
-        model_lon = f"{parameters.model_name.lower()}_lon"
+        # Calculate how many samples to write to current shard
+        remaining_in_shard = self.shard_size - self.samples_in_current_shard
+        samples_to_write = min(len(self.pending_results), remaining_in_shard)
         
-        # Flatten pending results into dataframe
-        all_data = []
-        for batch in self.pending_results:
-            batch_df = pd.DataFrame(batch)
-            all_data.append(batch_df)
+        # Write samples to current shard
+        shard_data = self.pending_results[:samples_to_write]
+        shard_df = pd.DataFrame(shard_data)
         
-        if not all_data:
-            return
+        current_shard_path = self._get_current_shard_path()
         
-        new_data = pd.concat(all_data, ignore_index=True)
-        
-        # Add model columns if they don't exist
-        if model_lat not in self.df.columns:
-            self.df[model_lat] = None
-        if model_lon not in self.df.columns:
-            self.df[model_lon] = None
-        
-        # Merge with existing dataframe
-        if self.df.empty:
-            self.df = new_data
+        if current_shard_path.exists():
+            # Append to existing shard
+            existing_df = pd.read_parquet(current_shard_path)
+            combined_df = pd.concat([existing_df, shard_df], ignore_index=True)
+            combined_df.to_parquet(current_shard_path, index=False)
         else:
-            # Set index for merging
-            df_indexed = self.df.set_index('idx') if 'idx' in self.df.columns and self.df.index.name != 'idx' else self.df.copy()
-            new_data_indexed = new_data.set_index('idx')
-            
-            # Update existing rows
-            df_indexed.update(new_data_indexed)
-            
-            # Add completely new indices
-            new_indices = new_data_indexed.index.difference(df_indexed.index)
-            if len(new_indices) > 0:
-                df_indexed = pd.concat([df_indexed, new_data_indexed.loc[new_indices]])
-            
-            self.df = df_indexed.reset_index()
+            # Create new shard
+            shard_df.to_parquet(current_shard_path, index=False)
         
-        # Save to disk
-        self._save_to_csv()
+        self.samples_in_current_shard += samples_to_write
+        self.logger.debug(f"Wrote {samples_to_write} samples to shard {self.current_shard}")
         
-        # Clear pending results
-        self.pending_results = []
+        # Remove written samples from pending
+        self.pending_results = self.pending_results[samples_to_write:]
+        
+        # If shard is full, move to next shard
+        if self.samples_in_current_shard >= self.shard_size:
+            self.current_shard += 1
+            self.samples_in_current_shard = 0
+            self.logger.info(f"Completed shard {self.current_shard - 1}, starting shard {self.current_shard}")
+        
+        return samples_to_write
     
-    def _save_to_csv(self):
-        """Save dataframe to CSV"""
-        df_to_save = self.df.copy()
-        if df_to_save.index.name == "idx":
-            df_to_save.reset_index(inplace=True)
-        df_to_save.to_csv(self.output_path, index=False)
-        
     def finalize(self):
-        """Merge any remaining results and perform final save"""
-        self._merge_and_save()
-        return self.df
+        """Flush any remaining results to current shard"""
+        self.logger.info("Finalizing Parquet writes")
+        if self.pending_results:
+            self._flush_to_current_shard()
+        
+        self.logger.info(f"Final predictions saved to {self.current_shard + 1} shard files in: {self.shard_dir}")
+        return self.total_samples_written
     
     def get_stats(self):
         """Get current stats"""
         return {
-            'total_rows': len(self.df),
-            'batches_processed': self.batch_count
+            'batches_processed': self.batch_count,
+            'total_samples_written': self.total_samples_written,
+            'current_shard': self.current_shard,
+            'samples_in_current_shard': self.samples_in_current_shard,
+            'shard_dir': str(self.shard_dir)
         }
-
-
-@ray.remote
-class ProgressTracker:
-    """Shared progress tracker across workers"""
-    
-    def __init__(self, total_batches):
-        self.total_batches = total_batches
-        self.completed_batches = 0
-        self.start_time = time.time()
-        self.last_print_time = time.time()
-        self.last_print_count = 0
-        self.last_save_count = 0
-    
-    def update(self, num_batches, batch_size):
-        """Update progress and return whether to print"""
-        self.completed_batches += num_batches
-        current_time = time.time()
-        
-        # Print every 2 seconds or every 10 batches
-        time_since_print = current_time - self.last_print_time
-        batches_since_print = self.completed_batches - self.last_print_count
-        
-        if time_since_print >= 2.0 or batches_since_print >= 10:
-            elapsed = current_time - self.start_time
-            percent = (self.completed_batches / self.total_batches) * 100
-            
-            # Calculate throughput since last print
-            images_processed = batches_since_print * batch_size
-            imgs_per_sec = images_processed / time_since_print if time_since_print > 0 else 0.0
-            
-            print(f"Progress: {self.completed_batches}/{self.total_batches} ({percent:.1f}%) | Imgs/s: {imgs_per_sec:.2f}")
-            
-            self.last_print_time = current_time
-            self.last_print_count = self.completed_batches
-            return True
-        return False
-    
-    def notify_save(self, batch_num):
-        """Notify that a checkpoint was saved"""
-        if batch_num > self.last_save_count + 50:  # Only print if significant progress
-            print(f"✓ Checkpoint saved at batch {batch_num}")
-            self.last_save_count = batch_num
 
 
 @ray.remote
 class PredictionWorker:
     """Ray actor that runs predictions on a single GPU"""
     
-    def __init__(self, config, worker_id):
+    def __init__(self, config, worker_id, log_dir="logs"):
         self.config = config
         self.worker_id = worker_id
-        # Ray isolates each worker to see only its assigned GPU as cuda:0
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # Debug: Show which physical GPU Ray assigned
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
+        # Setup logger for this worker
+        self.logger = setup_ray_actor_logging(f"Worker-{worker_id}", log_dir)
         
-        # Load model on this GPU
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
+        self.logger.info(f"Starting initialization - Device: {self.device}, CUDA_VISIBLE_DEVICES: {cuda_visible}")
+        
+        # Load model
         parameters = config.parameters
+        self.logger.info(f"Loading model: {parameters.model_name}")
         self.model = load_model(parameters.model_name)
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        print(f"Worker {worker_id} initialized on {self.device} (Ray assigned physical GPU: {cuda_visible})")
+        self.logger.info(f"Initialization complete on {self.device}")
     
-    def predict_indices(self, indices_chunk, progress_tracker, result_collector):
-        """Process a chunk of dataset indices"""
+    def predict_range(self, start_idx, end_idx, writer):
+        """Process a range of dataset indices [start_idx, end_idx)"""
+        self.logger.info(f"Processing range [{start_idx}, {end_idx})")
         parameters = self.config.parameters
         
-        # Create dataset and dataloader for this chunk
+        # Load transform and dataset
         transform = get_transform(parameters.transform_name)
         full_dataset = load_dataset(
             parameters.dataset_name, 
@@ -184,8 +253,12 @@ class PredictionWorker:
             max_shards=parameters.max_shards
         )
         
-        # Create subset for this worker
-        subset = Subset(full_dataset, indices_chunk)
+        # Create index range
+        indices = list(range(start_idx, min(end_idx, len(full_dataset))))
+        self.logger.info(f"Processing {len(indices)} samples")
+        
+        # Create subset and dataloader
+        subset = Subset(full_dataset, indices)
         dataloader = DataLoader(
             subset, 
             batch_size=parameters.batch_size, 
@@ -193,9 +266,14 @@ class PredictionWorker:
             num_workers=parameters.num_workers
         )
         
+        # Process batches
         for batch_idx, batch in enumerate(dataloader):
+            if batch_idx % 10 == 0:
+                progress = (batch_idx * parameters.batch_size) / len(indices) * 100
+                self.logger.info(f"Batch {batch_idx} ({progress:.1f}%)")
+            
             images = batch['image'].to(self.device)
-            idxs = batch['idx'].cpu().numpy()
+            image_bytes = batch['image_bytes']
             true_lat = batch['lat'].cpu().numpy()
             true_lon = batch['lon'].cpu().numpy()
             
@@ -205,176 +283,149 @@ class PredictionWorker:
                 pred_lat = pred_lat.cpu().numpy()
                 pred_lon = pred_lon.cpu().numpy()
             
-            # Store batch results
-            batch_results = {
-                'idx': idxs,
-                'true_lat': true_lat,
-                'true_lon': true_lon,
-                f"{parameters.model_name.lower()}_lat": pred_lat,
-                f"{parameters.model_name.lower()}_lon": pred_lon
-            }
+            # Prepare batch results as list of dicts
+            batch_results = []
             
-            # Send to result collector and check if save occurred
-            saved = ray.get(result_collector.add_results.remote(batch_results))
-            if saved:
-                stats = ray.get(result_collector.get_stats.remote())
-                ray.get(progress_tracker.notify_save.remote(stats['batches_processed']))
+            for i in range(len(image_bytes)):
+                batch_results.append({
+                    'image_bytes': image_bytes[i],
+                    'true_lat': float(true_lat[i]),
+                    'true_lon': float(true_lon[i]),
+                    'pred_lat': float(pred_lat[i]),
+                    'pred_lon': float(pred_lon[i])
+                })
             
-            # Update progress tracker
-            ray.get(progress_tracker.update.remote(1, parameters.batch_size))
+            # Send to writer
+            ray.get(writer.add_results.remote(batch_results))
         
-        # Worker completed
+        self.logger.info(f"Completed range [{start_idx}, {end_idx})")
         return True
-
-
-def get_completed_indices(config):
-    """Get indices that already have predictions"""
-    parameters = config.parameters
-    dataset_path = f"data/train/predictions/{parameters.dataset_name}.csv"
-    
-    if not os.path.exists(dataset_path):
-        return set()
-    
-    df = pd.read_csv(dataset_path)
-    model_col = f"{parameters.model_name.lower()}_lat"
-    
-    if model_col in df.columns and 'idx' in df.columns:
-        completed = set(df[df[model_col].notna()]['idx'].values)
-        return completed
-    
-    return set()
-
-
-def load_existing_dataframe(config):
-    """Load existing predictions dataframe"""
-    parameters = config.parameters
-    dataset_path = f"data/train/predictions/{parameters.dataset_name}.csv"
-    
-    if os.path.exists(dataset_path):
-        return pd.read_csv(dataset_path)
-    else:
-        return pd.DataFrame(columns=["idx", "true_lat", "true_lon"])
 
 
 def main():
     if len(sys.argv) < 2:
-        raise ValueError("Usage: python generate_distributed.py <config.yaml>")
+        raise ValueError("Usage: python generate_distributed.py <config.yaml> [start_idx] [end_idx]")
     
     config_path = sys.argv[1]
     config = load_config_yaml(config_path)
     parameters = config.parameters
     ray_config = config.ray
     
-    print(f"Configuration:\n{config}")
+    # Get log directory and output directory from config or use defaults
+    log_dir = getattr(config, 'log_dir', 'logs')
+    # Use DATASET_DIR environment variable if available, otherwise fall back to config or default
+    dataset_dir = os.getenv('DATASET_DIR')
+    if dataset_dir:
+        output_dir = os.path.join(dataset_dir, 'predictions')
+    else:
+        output_dir = getattr(parameters, 'output_dir', 'predictions')
+    
+    logger.info(f"SLURM Job ID: {os.environ.get('SLURM_JOB_ID', 'N/A')}")
+    logger.info(f"Configuration loaded from {config_path}")
+    logger.info(f"Logs directory: {log_dir}")
+    if dataset_dir:
+        logger.info(f"Using DATASET_DIR environment variable: {dataset_dir}")
+        logger.info(f"Predictions directory: {output_dir}")
+    else:
+        logger.info(f"Predictions directory: {output_dir}")
+    logger.debug(f"Configuration:\n{config}")
     
     # Initialize Ray
     if ray_config.address:
         ray.init(address=ray_config.address)
+        logger.info(f"Ray initialized with address: {ray_config.address}")
     else:
         ray.init()
+        logger.info("Ray initialized in local mode")
     
-    print(f"Ray initialized. Available resources: {ray.available_resources()}")
+    logger.info(f"Available resources: {ray.available_resources()}")
     
-    # Determine number of GPUs to use
+    # Determine number of GPUs
     num_gpus = int(ray.available_resources().get('GPU', 0))
     if num_gpus == 0:
-        print("WARNING: No GPUs detected. Falling back to CPU mode.")
+        logger.warning("No GPUs detected. Falling back to CPU mode.")
         num_gpus = 1
     
-    print(f"Using {num_gpus} GPU(s) for inference")
+    logger.info(f"Using {num_gpus} GPU(s) for inference")
     
-    # Load dataset to get total size
-    print("Loading dataset metadata...")
+    # Get dataset size (only need length, not all indices)
+    logger.info("Getting dataset size...")
     transform = get_transform(parameters.transform_name)
-    full_dataset = load_dataset(
+    temp_dataset = load_dataset(
         parameters.dataset_name, 
         transform=transform, 
         max_shards=parameters.max_shards
     )
-    total_samples = len(full_dataset)
-    print(f"Total dataset size: {total_samples}")
+    total_samples = len(temp_dataset)
+    del temp_dataset  # Free memory
     
-    # Get completed indices
-    print("Checking for existing predictions...")
-    completed_indices = get_completed_indices(config)
-    print(f"Found {len(completed_indices)} existing predictions")
+    # Optional: Allow processing only a slice of the dataset
+    start_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    end_idx = int(sys.argv[3]) if len(sys.argv) > 3 else total_samples
     
-    # Get remaining indices to process
-    all_indices = np.arange(total_samples)
-    remaining_indices = [idx for idx in all_indices if idx not in completed_indices]
+    logger.info(f"Dataset size: {total_samples}")
+    logger.info(f"Processing range: [{start_idx}, {end_idx})")
+    samples_to_process = end_idx - start_idx
     
-    if len(remaining_indices) == 0:
-        print("All predictions already completed!")
-        ray.shutdown()
-        return
+    # Split work into ranges for each GPU
+    indices_per_worker = samples_to_process // num_gpus
+    ranges = []
+    for i in range(num_gpus):
+        worker_start = start_idx + (i * indices_per_worker)
+        worker_end = start_idx + ((i + 1) * indices_per_worker) if i < num_gpus - 1 else end_idx
+        ranges.append((worker_start, worker_end))
     
-    print(f"Remaining predictions: {len(remaining_indices)}")
+    logger.info(f"Work distribution: {[(s, e, e-s) for s, e in ranges]}")
     
-    # Split indices across workers
-    indices_chunks = np.array_split(remaining_indices, num_gpus)
-    print(f"Split work into {num_gpus} chunks: {[len(chunk) for chunk in indices_chunks]}")
-    
-    # Calculate total batches for progress tracking
-    total_batches = sum([int(np.ceil(len(chunk) / parameters.batch_size)) for chunk in indices_chunks])
-    print(f"Total batches to process: {total_batches}")
-    
-    # Setup output path
-    output_dir = f"data/train/predictions"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = f"{output_dir}/{parameters.dataset_name}.csv"
-    
-    # Create shared actors
-    print("Creating shared actors...")
-    progress_tracker = ProgressTracker.remote(total_batches)
-    result_collector = ResultCollector.remote(
-        config, 
-        load_existing_dataframe(config), 
-        output_path,
-        save_interval=100  # Save every 100 batches
+    # Create sharded Parquet writer
+    logger.info("Creating sharded Parquet writer...")
+    writer = ParquetWriter.remote(
+        output_dir,
+        parameters.dataset_name,
+        parameters.model_name,
+        save_interval=500,
+        shard_size=20000,  # 50K samples per shard (adjust as needed)
+        log_dir=log_dir
     )
     
     # Create workers
-    print("Creating prediction workers...")
+    logger.info("Creating prediction workers...")
     workers = []
     for i in range(num_gpus):
-        worker = PredictionWorker.options(num_gpus=1).remote(config, i)
+        worker = PredictionWorker.options(num_gpus=1).remote(config, i, log_dir)
         workers.append(worker)
     
-    # Distribute work and collect results
-    print("Starting distributed prediction...")
-    print("-" * 60)
+    # Distribute work
+    logger.info("Starting distributed prediction...")
+    logger.info("-" * 60)
     start_time = time.time()
     
     futures = []
-    for worker, indices_chunk in zip(workers, indices_chunks):
-        if len(indices_chunk) > 0:
-            future = worker.predict_indices.remote(
-                indices_chunk.tolist(), 
-                progress_tracker,
-                result_collector
-            )
+    for i, (worker, (range_start, range_end)) in enumerate(zip(workers, ranges)):
+        if range_end > range_start:
+            logger.info(f"Worker {i}: processing [{range_start}, {range_end})")
+            future = worker.predict_range.remote(range_start, range_end, writer)
             futures.append(future)
     
-    # Wait for all workers to complete
+    # Wait for completion
     ray.get(futures)
     
-    print("-" * 60)
+    logger.info("-" * 60)
     elapsed_time = time.time() - start_time
-    total_processed = len(remaining_indices)
-    throughput = total_processed / elapsed_time if elapsed_time > 0 else 0
+    throughput = samples_to_process / elapsed_time if elapsed_time > 0 else 0
     
-    print(f"Prediction completed in {elapsed_time:.2f}s ({throughput:.2f} imgs/s)")
+    logger.info(f"Prediction completed in {elapsed_time:.2f}s ({throughput:.2f} imgs/s)")
     
-    # Finalize results (merge any remaining batches and save)
-    print("Finalizing results...")
-    final_df = ray.get(result_collector.finalize.remote())
+    # Finalize
+    logger.info("Finalizing results...")
+    final_samples = ray.get(writer.finalize.remote())
     
-    print(f"✓ Final predictions saved to {output_path}")
-    print(f"Total predictions in file: {len(final_df)}")
+    stats = ray.get(writer.get_stats.remote())
+    logger.info(f"All predictions saved to {stats['current_shard'] + 1} shard files in: {stats['shard_dir']}")
     
-    # Shutdown Ray
+    # Shutdown
     ray.shutdown()
-    print("Done!")
+    logger.info("Done!")
 
 
 if __name__ == "__main__":

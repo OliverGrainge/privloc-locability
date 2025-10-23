@@ -110,59 +110,10 @@ class YFCC100MDataset(Dataset):
             image = self.transform(image)
 
         return {
+            'image_bytes': image_bytes,
             'image': image,
             'lat': torch.tensor(float(record['latitude'])),
             'lon': torch.tensor(float(record['longitude'])),
-            'idx': idx
         }
 
-
-
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example: Load dataset with custom transform
-    from torch.utils.data import DataLoader
-    
-    
-    # Create dataset with training transforms
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
-
-    dataset = YFCC100MDataset(
-        transform=train_transform,
-        max_shards=1  # Limit to 1 shard for testing
-    )
-    
-    print(f"Dataset size: {len(dataset)}")
-    
-    # Create DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=32,
-        shuffle=True,
-        num_workers=4
-    )
-    
-    # Test loading a batch
-    for batch in dataloader:
-        images = batch['image']
-        latitudes = batch['latitude']
-        longitudes = batch['longitude']
-        ids = batch['id']
-        
-        print(f"Batch shape: {images.shape}")
-        print(f"Latitudes: {latitudes[:5]}")
-        print(f"Longitudes: {longitudes[:5]}")
-        print(f"IDs: {ids[:5]}")
-        break
 
