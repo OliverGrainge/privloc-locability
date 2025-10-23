@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 import torch
 
@@ -157,6 +157,9 @@ def setup_trainer(config: Dict[str, Any], config_name: str) -> pl.Trainer:
     
     # Add early stopping
     callbacks.append(setup_early_stopping())
+    
+    # Add learning rate monitor
+    callbacks.append(LearningRateMonitor(logging_interval='step'))
     
     # Setup logger
     logger = setup_logger(config, config_name)

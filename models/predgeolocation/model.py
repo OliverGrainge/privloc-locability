@@ -93,8 +93,8 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
     
     def compute_loss(self, pred_scores: torch.Tensor, true_scores: torch.Tensor) -> torch.Tensor:
         """
-        Compute the combined loss for error prediction.
-        
+        Compute the combined loss for error prediction, with additional stats.
+
         Args:
             pred_scores: Predicted log(1 + e) scores [batch_size, 1]
             true_scores: True log(1 + e) scores [batch_size, 1]
@@ -102,15 +102,35 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         Returns:
             Combined loss value
         """
-        # MSE loss for overall accuracy
-        mse_loss = self.mse_loss(pred_scores, true_scores)
+        pred_scores = pred_scores.squeeze()
+        true_scores = true_scores.squeeze()
         
-        # Huber loss for robustness to outliers
-        huber_loss = self.huber_loss(pred_scores, true_scores)
+        # Element-wise MSE and Huber loss for statistics
+        mse_loss_elem = (pred_scores - true_scores) ** 2
+        huber_loss_elem = F.smooth_l1_loss(pred_scores, true_scores, reduction='none')
+
+        # Reduce for the main loss values
+        mse_loss = mse_loss_elem.mean()
+        huber_loss = huber_loss_elem.mean()
         
         # Combined loss
         total_loss = self.hparams.loss_alpha * mse_loss + self.hparams.loss_beta * huber_loss
-        
+
+        # Log additional statistics: variance of losses
+        mse_var = mse_loss_elem.var(unbiased=False)
+        huber_var = huber_loss_elem.var(unbiased=False)
+
+        self.log('train/loss_mse', mse_loss, on_step=True)
+        self.log('train/loss_huber', huber_loss, on_step=True)
+        self.log('train/loss_mse_var', mse_var, on_step=True)
+        self.log('train/loss_huber_var', huber_var, on_step=True)
+
+        # Optionally, log max/min for further debugging
+        self.log('train/loss_mse_max', mse_loss_elem.max(), on_step=True)
+        self.log('train/loss_mse_min', mse_loss_elem.min(), on_step=True)
+        self.log('train/loss_huber_max', huber_loss_elem.max(), on_step=True)
+        self.log('train/loss_huber_min', huber_loss_elem.min(), on_step=True)
+
         return total_loss
     
     def compute_metrics(self, pred_scores: torch.Tensor, true_scores: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -184,6 +204,8 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         metrics = self.compute_metrics(pred_scores, true_scores)
         
         # Log metrics
+        self.log('train/batch_true_score_mean', true_errors.mean(), on_step=True)
+        self.log('train/batch_true_score_std', true_errors.std(), on_step=True)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         for key, value in metrics.items():
             self.log(f'train/{key}', value, on_step=True)
