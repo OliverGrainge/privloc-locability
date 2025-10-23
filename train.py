@@ -118,18 +118,8 @@ def create_model(config: Dict[str, Any]) -> GeolocationErrorPredictionModel:
     """
     model_config = config['model']
     
-    model = GeolocationErrorPredictionModel(
-        arch_name=model_config['arch_name'],
-        dataset_name=model_config['dataset_name'],
-        pred_model_name=model_config['pred_model_name'],
-        learning_rate=model_config['learning_rate'],
-        weight_decay=model_config['weight_decay'],
-        scheduler=model_config['scheduler'],
-        warmup_steps=model_config['warmup_steps'],
-        min_lr=model_config['min_lr'],
-        loss_alpha=model_config['loss_alpha'],
-        loss_beta=model_config['loss_beta']
-    )
+    # Pass all model configuration parameters
+    model = GeolocationErrorPredictionModel(**model_config)
     
     return model
 
@@ -164,20 +154,11 @@ def setup_trainer(config: Dict[str, Any], config_name: str) -> pl.Trainer:
     # Setup logger
     logger = setup_logger(config, config_name)
     
-    # Create trainer
+    # Create trainer with all configuration parameters
     trainer = pl.Trainer(
-        max_steps=trainer_config['max_steps'],
-        val_check_interval=trainer_config.get('val_check_interval', 1000),
-        limit_val_batches=trainer_config.get('limit_val_batches', None),
-        precision=trainer_config['precision'],
-        accelerator=trainer_config['accelerator'],
-        devices=trainer_config['devices'],
-        strategy=trainer_config['strategy'],
-        log_every_n_steps=trainer_config['log_every_n_steps'],
-        check_val_every_n_epoch=trainer_config['check_val_every_n_epoch'],
         callbacks=callbacks,
         logger=logger,
-        enable_progress_bar=trainer_config['enable_progress_bar'],
+        **trainer_config
     )
     
     return trainer

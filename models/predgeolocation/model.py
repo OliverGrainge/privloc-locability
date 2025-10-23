@@ -14,11 +14,14 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 import numpy as np
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import logging
 
 from .archs import load_arch_and_transform
 from data.datasets import load_prediction_dataset
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class GeolocationErrorPredictionModel(pl.LightningModule):
@@ -44,6 +47,8 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         loss_beta: float = 0.1,
         batch_size: int = 32,
         num_workers: int = 8,
+        head_type: str = 'regressor',
+        K_km: Optional[List[float]] = None,
         **arch_kwargs
     ):
         """
@@ -60,21 +65,26 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
             min_lr: Minimum learning rate for cosine scheduler
             loss_alpha: Weight for MSE loss component
             loss_beta: Weight for Huber loss component
+            head_type: Type of head ('regressor' or 'multik')
+            K_km: List of distance thresholds in km for MultiKHead
             **arch_kwargs: Additional arguments for architecture loading
         """
         super().__init__()
         self.save_hyperparameters()
         
         # Load the backbone architecture
-        self.model, self.transform = load_arch_and_transform(arch_name, **arch_kwargs)
-        
+        if head_type == 'multik':
+            arch_kwargs['K_km'] = K_km
+        self.model, self.transform = load_arch_and_transform(arch_name, head_type=head_type, **arch_kwargs)
+
         # Loss function components
         self.mse_loss = nn.MSELoss()
         self.huber_loss = nn.SmoothL1Loss()
+        if head_type == 'multik':
+            self.bce_loss = nn.BCEWithLogitsLoss()
         
         # Metrics tracking
         self.train_metrics = {}
-        self.val_metrics = {}
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -91,87 +101,124 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         
         return error_score
     
-    def compute_loss(self, pred_scores: torch.Tensor, true_scores: torch.Tensor) -> torch.Tensor:
+    def compute_loss(self, pred_scores: torch.Tensor, true_scores: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute the combined loss for error prediction, with additional stats.
 
         Args:
-            pred_scores: Predicted log(1 + e) scores [batch_size, 1]
-            true_scores: True log(1 + e) scores [batch_size, 1]
+            pred_scores: Predicted scores [batch_size, 1] for regressor or [batch_size, m] for multik
+            true_scores: True scores [batch_size, 1] for regressor or [batch_size, m] for multik
             
         Returns:
-            Combined loss value
+            Tuple of (loss_value, metrics_dict)
         """
-        pred_scores = pred_scores.squeeze()
-        true_scores = true_scores.squeeze()
-        
-        # Element-wise MSE and Huber loss for statistics
-        mse_loss_elem = (pred_scores - true_scores) ** 2
-        huber_loss_elem = F.smooth_l1_loss(pred_scores, true_scores, reduction='none')
+        if self.hparams.head_type == 'multik':
+            # MultiKHead: pred_scores and true_scores are [batch_size, m] logits
+            # true_scores should be binary targets [batch_size, m]
+            bce_loss = self.bce_loss(pred_scores, true_scores)
+            
+            return bce_loss, {'loss_bce': bce_loss}
+        else:
+            # Regressor head: pred_scores and true_scores are [batch_size, 1]
+            pred_scores = pred_scores.squeeze()
+            true_scores = true_scores.squeeze()
+            
+            # Element-wise MSE and Huber loss for statistics
+            mse_loss_elem = (pred_scores - true_scores) ** 2
+            huber_loss_elem = F.smooth_l1_loss(pred_scores, true_scores, reduction='none')
 
-        # Reduce for the main loss values
-        mse_loss = mse_loss_elem.mean()
-        huber_loss = huber_loss_elem.mean()
-        
-        # Combined loss
-        total_loss = self.hparams.loss_alpha * mse_loss + self.hparams.loss_beta * huber_loss
+            # Reduce for the main loss values
+            mse_loss = mse_loss_elem.mean()
+            huber_loss = huber_loss_elem.mean()
+            
+            # Combined loss
+            total_loss = self.hparams.loss_alpha * mse_loss + self.hparams.loss_beta * huber_loss
 
-        # Log additional statistics: variance of losses
-        mse_var = mse_loss_elem.var(unbiased=False)
-        huber_var = huber_loss_elem.var(unbiased=False)
+            # Prepare metrics for logging
+            metrics = {
+                'loss_mse': mse_loss,
+                'loss_huber': huber_loss,
+                'loss_alpha': self.hparams.loss_alpha,
+                'loss_beta': self.hparams.loss_beta,
+                'loss_mse_var': mse_loss_elem.var(unbiased=False),
+                'loss_huber_var': huber_loss_elem.var(unbiased=False),
+                'loss_mse_max': mse_loss_elem.max(),
+                'loss_mse_min': mse_loss_elem.min(),
+                'loss_huber_max': huber_loss_elem.max(),
+                'loss_huber_min': huber_loss_elem.min(),
+            }
 
-        self.log('train/loss_mse', mse_loss, on_step=True)
-        self.log('train/loss_huber', huber_loss, on_step=True)
-        self.log('train/loss_mse_var', mse_var, on_step=True)
-        self.log('train/loss_huber_var', huber_var, on_step=True)
+            # Log prediction error statistics
+            pred_error = torch.abs(pred_scores - true_scores)
+            metrics.update({
+                'pred_error_mean': pred_error.mean(),
+                'pred_error_std': pred_error.std(),
+                'pred_error_max': pred_error.max(),
+                'pred_error_min': pred_error.min()
+            })
 
-        # Optionally, log max/min for further debugging
-        self.log('train/loss_mse_max', mse_loss_elem.max(), on_step=True)
-        self.log('train/loss_mse_min', mse_loss_elem.min(), on_step=True)
-        self.log('train/loss_huber_max', huber_loss_elem.max(), on_step=True)
-        self.log('train/loss_huber_min', huber_loss_elem.min(), on_step=True)
-
-        return total_loss
+            return total_loss, metrics
     
     def compute_metrics(self, pred_scores: torch.Tensor, true_scores: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Compute evaluation metrics.
         
         Args:
-            pred_scores: Predicted log(1 + e) scores
-            true_scores: True log(1 + e) scores
+            pred_scores: Predicted scores [batch_size, 1] for regressor or [batch_size, m] for multik
+            true_scores: True scores [batch_size, 1] for regressor or [batch_size, m] for multik
             
         Returns:
             Dictionary of metrics
         """
-        # Convert back to actual errors for metrics
-        pred_errors = torch.exp(pred_scores.squeeze()) - 1
-        true_errors = torch.exp(true_scores.squeeze()) - 1
-        
-        # Mean Absolute Error
-        mae = F.l1_loss(pred_errors, true_errors)
-        
-        # Mean Squared Error
-        mse = F.mse_loss(pred_errors, true_errors)
-        
-        # Root Mean Squared Error
-        rmse = torch.sqrt(mse)
-        
-        # Mean Absolute Percentage Error
-        mape = torch.mean(torch.abs((true_errors - pred_errors) / (true_errors + 1e-8))) * 100
-        
-        # Correlation coefficient
-        pred_flat = pred_errors.flatten()
-        true_flat = true_errors.flatten()
-        correlation = torch.corrcoef(torch.stack([pred_flat, true_flat]))[0, 1]
-        
-        return {
-            'mae': mae,
-            'mse': mse,
-            'rmse': rmse,
-            'mape': mape,
-            'correlation': correlation
-        }
+        if self.hparams.head_type == 'multik':
+            # MultiKHead: compute accuracy for each threshold
+            pred_probs = torch.sigmoid(pred_scores)  # Convert logits to probabilities
+            pred_binary = (pred_probs > 0.5).float()  # Convert to binary predictions
+            
+            # Compute accuracy for each threshold
+            accuracies = []
+            for k in range(pred_scores.shape[1]):
+                acc = (pred_binary[:, k] == true_scores[:, k]).float().mean()
+                accuracies.append(acc)
+            
+            # Overall accuracy (average across all thresholds)
+            overall_acc = torch.stack(accuracies).mean()
+            
+            # Individual threshold accuracies
+            metrics = {'overall_accuracy': overall_acc}
+            for k, acc in enumerate(accuracies):
+                metrics[f'acc_thresh_{k}'] = acc
+            
+            return metrics
+        else:
+            # Regressor head: convert back to actual errors for metrics
+            pred_errors = torch.exp(pred_scores.squeeze()) - 1
+            true_errors = torch.exp(true_scores.squeeze()) - 1
+            
+            # Mean Absolute Error
+            mae = F.l1_loss(pred_errors, true_errors)
+            
+            # Mean Squared Error
+            mse = F.mse_loss(pred_errors, true_errors)
+            
+            # Root Mean Squared Error
+            rmse = torch.sqrt(mse)
+            
+            # Mean Absolute Percentage Error
+            mape = torch.mean(torch.abs((true_errors - pred_errors) / (true_errors + 1e-8))) * 100
+            
+            # Correlation coefficient
+            pred_flat = pred_errors.flatten()
+            true_flat = true_errors.flatten()
+            correlation = torch.corrcoef(torch.stack([pred_flat, true_flat]))[0, 1]
+            
+            return {
+                'mae': mae,
+                'mse': mse,
+                'rmse': rmse,
+                'mape': mape,
+                'correlation': correlation
+            }
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
@@ -184,70 +231,78 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         Returns:
             Training loss
         """
+        # Extract batch data
         images = batch['image']
         true_lat = batch['true_lat']
         true_lon = batch['true_lon']
         pred_lat = batch['pred_lat']
         pred_lon = batch['pred_lon']
         
+        # Log batch information
+        self.log('train/batch_size', images.shape[0])
+        self.log('train/image_mean', images.mean())
+        self.log('train/image_std', images.std())
+        
         # Calculate true geodetic errors
         true_errors = self._calculate_geodetic_errors(true_lat, true_lon, pred_lat, pred_lon)
-        true_scores = torch.log(1 + true_errors).unsqueeze(1)
+        
+        # Log error statistics
+        self.log('train/true_errors_mean', true_errors.mean())
+        self.log('train/true_errors_std', true_errors.std())
+        self.log('train/true_errors_min', true_errors.min())
+        self.log('train/true_errors_max', true_errors.max())
+        
+        if self.hparams.head_type == 'multik':
+            # MultiKHead: create binary targets for each threshold
+            K_km = self.model.head.K.to(true_errors.device)
+            true_scores = (true_errors.unsqueeze(1) <= K_km.unsqueeze(0)).float()
+            
+            # Log MultiK specific statistics
+            self.log('train/true_scores_mean', true_scores.mean())
+            self.log('train/true_scores_std', true_scores.std())
+            
+            # Log threshold-specific statistics
+            for k, threshold in enumerate(K_km):
+                threshold_accuracy = true_scores[:, k].mean()
+                self.log(f'train/threshold_{k}_accuracy', threshold_accuracy)
+        else:
+            # Regressor head: log-transformed errors
+            true_scores = torch.log(1 + true_errors).unsqueeze(1)
+            
+            # Log regressor specific statistics
+            self.log('train/true_scores_mean', true_scores.mean())
+            self.log('train/true_scores_std', true_scores.std())
+            self.log('train/true_scores_min', true_scores.min())
+            self.log('train/true_scores_max', true_scores.max())
         
         # Forward pass
         pred_scores = self(images)
         
-        # Compute loss
-        loss = self.compute_loss(pred_scores, true_scores)
+        # Log prediction statistics
+        self.log('train/pred_scores_mean', pred_scores.mean())
+        self.log('train/pred_scores_std', pred_scores.std())
+        self.log('train/pred_scores_min', pred_scores.min())
+        self.log('train/pred_scores_max', pred_scores.max())
         
-        # Compute metrics
-        metrics = self.compute_metrics(pred_scores, true_scores)
+        # Compute loss and get loss metrics
+        loss, loss_metrics = self.compute_loss(pred_scores, true_scores)
         
-        # Log metrics
-        self.log('train/batch_true_score_mean', true_errors.mean(), on_step=True)
-        self.log('train/batch_true_score_std', true_errors.std(), on_step=True)
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        for key, value in metrics.items():
-            self.log(f'train/{key}', value, on_step=True)
+        # Compute evaluation metrics
+        eval_metrics = self.compute_metrics(pred_scores, true_scores)
+        
+        # Log main loss
+        self.log('train/loss', loss, prog_bar=True)
+        
+        # Log all loss-related metrics
+        for key, value in loss_metrics.items():
+            self.log(f'train/{key}', value)
+        
+        # Log all evaluation metrics
+        for key, value in eval_metrics.items():
+            self.log(f'train/{key}', value)
         
         return loss
     
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """
-        Validation step.
-        
-        Args:
-            batch: Batch containing 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
-            batch_idx: Batch index
-            
-        Returns:
-            Validation loss
-        """
-        images = batch['image']
-        true_lat = batch['true_lat']
-        true_lon = batch['true_lon']
-        pred_lat = batch['pred_lat']
-        pred_lon = batch['pred_lon']
-        
-        # Calculate true geodetic errors
-        true_errors = self._calculate_geodetic_errors(true_lat, true_lon, pred_lat, pred_lon)
-        true_scores = torch.log(1 + true_errors).unsqueeze(1)
-        
-        # Forward pass
-        pred_scores = self(images)
-        
-        # Compute loss
-        loss = self.compute_loss(pred_scores, true_scores)
-        
-        # Compute metrics
-        metrics = self.compute_metrics(pred_scores, true_scores)
-        
-        # Log metrics
-        self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        for key, value in metrics.items():
-            self.log(f'val/{key}', value, on_step=False, on_epoch=True, prog_bar=True)
-        
-        return loss
     
     def _calculate_geodetic_errors(self, true_lat: torch.Tensor, true_lon: torch.Tensor, 
                                  pred_lat: torch.Tensor, pred_lon: torch.Tensor) -> torch.Tensor:
@@ -337,7 +392,7 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
-                    'monitor': 'val/loss',
+                    'monitor': 'train/loss',
                     'interval': 'epoch',
                     'frequency': 1
                 }
@@ -353,7 +408,7 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
             image: Input image tensor [1, channels, height, width]
             
         Returns:
-            Predicted log(1 + e) error score
+            Predicted log(1 + e) error score for regressor or logits for multik
         """
         self.eval()
         with torch.no_grad():
@@ -367,10 +422,29 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
             image: Input image tensor [1, channels, height, width]
             
         Returns:
-            Predicted geodetic error in kilometers
+            Predicted geodetic error in kilometers (only for regressor head)
         """
+        if self.hparams.head_type == 'multik':
+            raise ValueError("predict_actual_error not supported for MultiKHead. Use predict_recall_at_km instead.")
+        
         log_score = self.predict_error_score(image)
         return torch.exp(log_score) - 1
+    
+    def predict_recall_at_km(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Predict recall probabilities at different distance thresholds.
+        
+        Args:
+            image: Input image tensor [1, channels, height, width]
+            
+        Returns:
+            Predicted probabilities [1, m] for each threshold
+        """
+        if self.hparams.head_type != 'multik':
+            raise ValueError("predict_recall_at_km only supported for MultiKHead.")
+        
+        logits = self.predict_error_score(image)
+        return torch.sigmoid(logits)
     
     def train_dataloader(self) -> DataLoader:
         """
@@ -400,31 +474,4 @@ class GeolocationErrorPredictionModel(pl.LightningModule):
         
         return dataloader
     
-    def test_dataloader(self) -> DataLoader:
-        """
-        Create test dataloader.
-        
-        Returns:
-            DataLoader for test data
-        """
-        # Load the prediction dataset
-        dataset = load_prediction_dataset(
-            dataset_name=self.hparams.dataset_name,
-            model_name=self.hparams.pred_model_name,
-            transform=self.transform,
-            max_samples=None  # Use all test samples
-        )
-        
-        # Create DataLoader with memory-optimized settings
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.hparams.batch_size,  # Default batch size, can be made configurable
-            shuffle=False,  # No shuffling for test data
-            num_workers=self.hparams.num_workers,  # Reduced workers to avoid memory issues
-            pin_memory=False,  # Disable pin_memory to save memory
-            drop_last=False,  # Don't drop last batch for test data
-            prefetch_factor=1  # Must be None when num_workers=0
-        )
-        
-        return dataloader
 

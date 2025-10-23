@@ -1,11 +1,12 @@
 
-
 model: 
-  arch_name: "megaloc"
+  arch_name: "siglip"
   dataset_name: "yfcc100m"
   pred_model_name: "geoclip"
+  head_type: "multik"
+  K_km: [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
   learning_rate: 0.0001
-  weight_decay: 0.0
+  weight_decay: 0.00001
   scheduler: 'cosine'
   warmup_steps: 10
   min_lr: 0.00001
@@ -24,6 +25,7 @@ trainer:
   log_every_n_steps: 10
   enable_progress_bar: False
   check_val_every_n_epoch: 0 
+
 
 
 checkpoint: True 
