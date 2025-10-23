@@ -2,12 +2,12 @@
 Prediction-based geolocation models for error estimation.
 """
 
-from .model import ErrorPredictionModel
-from .archs import load_arch, DINOv2, SigLip
+from .model import GeolocationErrorPredictionModel
 
 __all__ = [
-    'ErrorPredictionModel',
+    'GeolocationErrorPredictionModel',
     'load_arch',
     'DINOv2',
     'SigLip'
+
 ]

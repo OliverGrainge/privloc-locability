@@ -2,27 +2,27 @@ Prediction Dataset Analysis Statistics
 ==================================================
 
 Dataset Information:
-  Total samples: 29,999
+  Total samples: 100,000
 
 Error Statistics (km):
-  Mean error: 2474.23
-  Median error: 556.01
-  Std deviation: 3981.28
+  Mean error: 2490.09
+  Median error: 545.06
+  Std deviation: 4019.57
   Min error: 0.00
-  Max error: 19773.94
-  25th percentile: 44.21
-  75th percentile: 2730.43
-  90th percentile: 8798.84
-  95th percentile: 11271.38
-  99th percentile: 16928.26
+  Max error: 19933.29
+  25th percentile: 47.47
+  75th percentile: 2737.90
+  90th percentile: 8865.34
+  95th percentile: 11497.76
+  99th percentile: 16928.54
 
 Recall@km Statistics:
   recall@1km: 0.114
-  recall@5km: 0.173
-  recall@10km: 0.197
-  recall@25km: 0.228
-  recall@50km: 0.255
-  recall@100km: 0.293
-  recall@200km: 0.352
-  recall@500km: 0.480
-  recall@1000km: 0.605
+  recall@5km: 0.171
+  recall@10km: 0.194
+  recall@25km: 0.224
+  recall@50km: 0.253
+  recall@100km: 0.291
+  recall@200km: 0.353
+  recall@500km: 0.484
+  recall@1000km: 0.609

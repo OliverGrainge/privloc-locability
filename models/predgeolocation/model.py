@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 import numpy as np
 from typing import Optional, Dict, Any, Tuple
@@ -21,7 +21,7 @@ from .archs import load_arch_and_transform
 from data.datasets import load_prediction_dataset
 
 
-class ErrorPredictionModel(pl.LightningModule):
+class GeolocationErrorPredictionModel(pl.LightningModule):
     """
     PyTorch Lightning model for predicting log(1 + e) of geolocation error.
     
@@ -38,10 +38,12 @@ class ErrorPredictionModel(pl.LightningModule):
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
         scheduler: str = 'cosine',
-        warmup_epochs: int = 5,
+        warmup_steps: int = 1000,
         min_lr: float = 1e-6,
         loss_alpha: float = 1.0,
         loss_beta: float = 0.1,
+        batch_size: int = 32,
+        num_workers: int = 8,
         **arch_kwargs
     ):
         """
@@ -54,7 +56,7 @@ class ErrorPredictionModel(pl.LightningModule):
             learning_rate: Learning rate for optimizer
             weight_decay: Weight decay for regularization
             scheduler: Learning rate scheduler ('cosine', 'plateau', or 'none')
-            warmup_epochs: Number of warmup epochs for cosine scheduler
+            warmup_steps: Number of warmup steps for cosine scheduler
             min_lr: Minimum learning rate for cosine scheduler
             loss_alpha: Weight for MSE loss component
             loss_beta: Weight for Huber loss component
@@ -64,25 +66,7 @@ class ErrorPredictionModel(pl.LightningModule):
         self.save_hyperparameters()
         
         # Load the backbone architecture
-        self.backbone, self.transform = load_arch_and_transform(arch_name, **arch_kwargs)
-        
-        # Add regression head for error prediction
-        # Assuming backbone outputs a feature vector
-        if hasattr(self.backbone, 'num_features'):
-            feature_dim = self.backbone.num_features
-        else:
-            # Default feature dimension (adjust based on your architecture)
-            feature_dim = 512
-        
-        self.regression_head = nn.Sequential(
-            nn.Linear(feature_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 1)  # Output single scalar
-        )
+        self.model, self.transform = load_arch_and_transform(arch_name, **arch_kwargs)
         
         # Loss function components
         self.mse_loss = nn.MSELoss()
@@ -103,10 +87,7 @@ class ErrorPredictionModel(pl.LightningModule):
             Predicted log(1 + e) error scores [batch_size, 1]
         """
         # Extract features using backbone
-        features = self.backbone(x)
-        
-        # Predict error score
-        error_score = self.regression_head(features)
+        error_score = self.model(x)
         
         return error_score
     
@@ -205,7 +186,7 @@ class ErrorPredictionModel(pl.LightningModule):
         # Log metrics
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         for key, value in metrics.items():
-            self.log(f'train/{key}', value, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f'train/{key}', value, on_step=True)
         
         return loss
     
@@ -286,16 +267,39 @@ class ErrorPredictionModel(pl.LightningModule):
         )
         
         if self.hparams.scheduler == 'cosine':
-            scheduler = CosineAnnealingLR(
+            # Calculate total steps for cosine annealing
+            # Assuming we need to estimate total steps from max_epochs
+            # This is a rough estimate - in practice, you might want to pass total_steps explicitly
+            steps_per_epoch = len(self.train_dataloader()) if hasattr(self, 'trainer') and self.trainer else 1000
+            total_steps = self.trainer.max_epochs * steps_per_epoch if hasattr(self, 'trainer') and self.trainer else 100000
+            
+            # Create warmup scheduler
+            warmup_scheduler = LinearLR(
                 optimizer,
-                T_max=self.trainer.max_epochs,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=self.hparams.warmup_steps
+            )
+            
+            # Create cosine annealing scheduler
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps - self.hparams.warmup_steps,
                 eta_min=self.hparams.min_lr
             )
+            
+            # Combine warmup and cosine annealing
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[self.hparams.warmup_steps]
+            )
+            
             return {
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
-                    'interval': 'epoch',
+                    'interval': 'step',
                     'frequency': 1
                 }
             }
@@ -361,14 +365,15 @@ class ErrorPredictionModel(pl.LightningModule):
             max_samples=None  # Use all training samples
         )
         
-        # Create DataLoader
+        # Create DataLoader with memory-optimized settings
         dataloader = DataLoader(
             dataset,
-            batch_size=32,  # Default batch size, can be made configurable
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=True
+            batch_size=self.hparams.batch_size,  # Default batch size, can be made configurable
+            shuffle=False,
+            num_workers=self.hparams.num_workers,  # Reduced workers to avoid memory issues
+            pin_memory=False,  # Disable pin_memory to save memory
+            drop_last=True,
+            prefetch_factor=1  # Must be None when num_workers=0
         )
         
         return dataloader
@@ -388,14 +393,15 @@ class ErrorPredictionModel(pl.LightningModule):
             max_samples=None  # Use all test samples
         )
         
-        # Create DataLoader
+        # Create DataLoader with memory-optimized settings
         dataloader = DataLoader(
             dataset,
-            batch_size=32,  # Default batch size, can be made configurable
+            batch_size=self.hparams.batch_size,  # Default batch size, can be made configurable
             shuffle=False,  # No shuffling for test data
-            num_workers=4,
-            pin_memory=True,
-            drop_last=False  # Don't drop last batch for test data
+            num_workers=self.hparams.num_workers,  # Reduced workers to avoid memory issues
+            pin_memory=False,  # Disable pin_memory to save memory
+            drop_last=False,  # Don't drop last batch for test data
+            prefetch_factor=1  # Must be None when num_workers=0
         )
         
         return dataloader

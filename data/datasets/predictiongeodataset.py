@@ -4,9 +4,10 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from io import BytesIO
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, List
 from pathlib import Path
 import glob
+from tqdm import tqdm 
 
 
 class PredictionGeoDataset(Dataset):
@@ -37,45 +38,153 @@ class PredictionGeoDataset(Dataset):
         """
         self.parquet_path = Path(parquet_path)
         self.transform = transform
+        self.max_samples = max_samples
         
         # Determine if we have a single file or sharded files
         if self.parquet_path.is_file():
             # Single parquet file
-            parquet_files = [self.parquet_path]
+            self.parquet_files = [self.parquet_path]
         elif self.parquet_path.is_dir():
             # Directory with sharded files
-            parquet_files = sorted(self.parquet_path.glob("part_*.parquet"))
-            if not parquet_files:
+            self.parquet_files = sorted(self.parquet_path.glob("part_*.parquet"))
+            if not self.parquet_files:
                 raise FileNotFoundError(f"No parquet files found in directory: {self.parquet_path}")
         else:
             raise FileNotFoundError(f"Parquet path not found: {self.parquet_path}")
         
-        # Load all parquet files
-        print(f"Loading prediction data from {len(parquet_files)} parquet file(s)")
-        dfs = []
-        for file_path in parquet_files:
-            print(f"Loading {file_path}")
-            df = pd.read_parquet(file_path)
-            dfs.append(df)
+        # Initialize lazy loading state
+        self.current_file_idx = None
+        self.current_df = None
+        self.file_start_indices = []
+        self.total_samples = 0
         
-        # Concatenate all dataframes
-        self.df = pd.concat(dfs, ignore_index=True)
+        # Prefetching state
+        self.prefetch_next = True
+        self.next_file_df = None
+        self.next_file_idx = None
+        
+        # Calculate file start indices and total samples without loading data
+        print(f"Scanning {len(self.parquet_files)} parquet file(s) for metadata")
+        for i, file_path in enumerate(self.parquet_files):
+            # Read just the metadata to get row count
+            df_meta = pd.read_parquet(file_path, engine='pyarrow')
+            file_rows = len(df_meta)
+            self.file_start_indices.append(self.total_samples)
+            self.total_samples += file_rows
+            print(f"File {i + 1}/{len(self.parquet_files)}: {file_path} ({file_rows} rows)")
         
         # Apply max_samples limit if specified
-        if max_samples is not None:
-            self.df = self.df.head(max_samples)
+        if self.max_samples is not None:
+            self.total_samples = min(self.total_samples, self.max_samples)
         
-        print(f"Loaded {len(self.df)} prediction samples from {len(parquet_files)} file(s)")
+        print(f"Total samples across all files: {self.total_samples}")
         
-        # Verify required columns exist
-        required_columns = ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon']
-        missing_columns = [col for col in required_columns if col not in self.df.columns]
-        if missing_columns:
-            raise ValueError(f"Missing required columns in parquet file: {missing_columns}")
+        # Verify required columns exist by checking the first file
+        if self.parquet_files:
+            sample_df = pd.read_parquet(self.parquet_files[0])
+            required_columns = ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon']
+            missing_columns = [col for col in required_columns if col not in sample_df.columns]
+            if missing_columns:
+                raise ValueError(f"Missing required columns in parquet file: {missing_columns}")
+    
+    def _load_file_if_needed(self, file_idx: int):
+        """Load a parquet file if it's not currently loaded."""
+        if self.current_file_idx != file_idx:
+            # Check if we have prefetched data for this file
+            if self.next_file_idx == file_idx and self.next_file_df is not None:
+                print(f"Using prefetched Shard {file_idx + 1}/{len(self.parquet_files)}: {self.parquet_files[file_idx]}")
+                self.current_df = self.next_file_df
+                self.current_file_idx = file_idx
+                self.next_file_df = None
+                self.next_file_idx = None
+            else:
+                # Clear previous file from memory
+                if self.current_file_idx is not None and self.current_df is not None:
+                    del self.current_df
+                    import gc
+                    gc.collect()
+                    # Clear CUDA cache if available
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
+                
+                print(f"Loading Shard {file_idx + 1}/{len(self.parquet_files)}: {self.parquet_files[file_idx]}")
+                self.current_df = pd.read_parquet(self.parquet_files[file_idx])
+                self.current_file_idx = file_idx
+            
+            # Prefetch next file if available
+            if self.prefetch_next and file_idx + 1 < len(self.parquet_files):
+                self._prefetch_next_file(file_idx)
+    
+    def _prefetch_next_file(self, current_file_idx: int):
+        """Prefetch the next file in background."""
+        next_file_idx = current_file_idx + 1
+        if next_file_idx < len(self.parquet_files) and self.next_file_idx != next_file_idx:
+            try:
+                print(f"Prefetching Shard {next_file_idx + 1}/{len(self.parquet_files)}: {self.parquet_files[next_file_idx]}")
+                self.next_file_df = pd.read_parquet(self.parquet_files[next_file_idx])
+                self.next_file_idx = next_file_idx
+            except Exception as e:
+                print(f"Failed to prefetch file {next_file_idx}: {e}")
+                self.next_file_df = None
+                self.next_file_idx = None
+    
+    def get_file_samples(self, file_idx: int) -> List[dict]:
+        """
+        Get all samples from a specific parquet file.
+        This is more efficient than random access when you need all samples from a file.
+        
+        Args:
+            file_idx: Index of the parquet file to load
+            
+        Returns:
+            List of sample dictionaries
+        """
+        if file_idx < 0 or file_idx >= len(self.parquet_files):
+            raise IndexError(f"File index {file_idx} out of range for {len(self.parquet_files)} files")
+        
+        # Load the file
+        self._load_file_if_needed(file_idx)
+        
+        samples = []
+        for i in range(len(self.current_df)):
+            # Calculate global index
+            global_idx = self.file_start_indices[file_idx] + i
+            
+            # Apply max_samples limit if specified
+            if self.max_samples is not None and global_idx >= self.max_samples:
+                break
+                
+            row = self.current_df.iloc[i]
+            
+            # Decode image from bytes
+            image_bytes = row['image_bytes']
+            if isinstance(image_bytes, str):
+                image_bytes = image_bytes.encode('latin1')
+            
+            image = Image.open(BytesIO(image_bytes)).convert('RGB')
+            
+            # Apply transform if provided
+            if self.transform:
+                image = self.transform(image)
+            
+            samples.append({
+                'image': image,
+                'true_lat': torch.tensor(float(row['true_lat'])),
+                'true_lon': torch.tensor(float(row['true_lon'])),
+                'pred_lat': torch.tensor(float(row['pred_lat'])),
+                'pred_lon': torch.tensor(float(row['pred_lon'])),
+                'idx': torch.tensor(global_idx)
+            })
+        
+        return samples
     
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
-        return len(self.df)
+        return self.total_samples
     
     def __getitem__(self, idx: int) -> dict:
         """
@@ -96,8 +205,30 @@ class PredictionGeoDataset(Dataset):
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
         
+        # Apply max_samples limit if specified
+        if self.max_samples is not None and idx >= self.max_samples:
+            raise IndexError(f"Index {idx} exceeds max_samples limit of {self.max_samples}")
+        
+        # Find which file contains this index
+        file_idx = 0
+        for i, start_idx in enumerate(self.file_start_indices):
+            if i + 1 < len(self.file_start_indices):
+                next_start = self.file_start_indices[i + 1]
+            else:
+                next_start = self.total_samples
+            
+            if start_idx <= idx < next_start:
+                file_idx = i
+                break
+        
+        # Load the file if needed
+        self._load_file_if_needed(file_idx)
+        
+        # Calculate the local index within the current file
+        local_idx = idx - self.file_start_indices[file_idx]
+        
         # Get the row data
-        row = self.df.iloc[idx]
+        row = self.current_df.iloc[local_idx]
         
         # Decode image from bytes
         image_bytes = row['image_bytes']
@@ -126,20 +257,39 @@ class PredictionGeoDataset(Dataset):
         Returns:
             Dictionary containing dataset statistics
         """
-        # Find all parquet files that were loaded
-        if self.parquet_path.is_file():
-            parquet_files = [str(self.parquet_path)]
-        else:
-            parquet_files = [str(f) for f in sorted(self.parquet_path.glob("part_*.parquet"))]
+        # Get file information
+        parquet_files = [str(f) for f in self.parquet_files]
+        
+        # For coordinate ranges, we need to load all files and compute statistics
+        # This is expensive but necessary for accurate stats
+        print("Computing coordinate statistics across all files...")
+        all_lats = []
+        all_lons = []
+        all_pred_lats = []
+        all_pred_lons = []
+        
+        for file_path in self.parquet_files:
+            df = pd.read_parquet(file_path)
+            all_lats.extend(df['true_lat'].tolist())
+            all_lons.extend(df['true_lon'].tolist())
+            all_pred_lats.extend(df['pred_lat'].tolist())
+            all_pred_lons.extend(df['pred_lon'].tolist())
+        
+        # Apply max_samples limit if specified
+        if self.max_samples is not None:
+            all_lats = all_lats[:self.max_samples]
+            all_lons = all_lons[:self.max_samples]
+            all_pred_lats = all_pred_lats[:self.max_samples]
+            all_pred_lons = all_pred_lons[:self.max_samples]
         
         return {
-            'total_samples': len(self.df),
+            'total_samples': self.total_samples,
             'parquet_path': str(self.parquet_path),
             'parquet_files': parquet_files,
             'num_shards': len(parquet_files),
-            'columns': list(self.df.columns),
-            'lat_range': (self.df['true_lat'].min(), self.df['true_lat'].max()),
-            'lon_range': (self.df['true_lon'].min(), self.df['true_lon'].max()),
-            'pred_lat_range': (self.df['pred_lat'].min(), self.df['pred_lat'].max()),
-            'pred_lon_range': (self.df['pred_lon'].min(), self.df['pred_lon'].max())
+            'columns': ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'],
+            'lat_range': (min(all_lats), max(all_lats)),
+            'lon_range': (min(all_lons), max(all_lons)),
+            'pred_lat_range': (min(all_pred_lats), max(all_pred_lats)),
+            'pred_lon_range': (min(all_pred_lons), max(all_pred_lons))
         }

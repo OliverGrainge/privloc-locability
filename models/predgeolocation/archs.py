@@ -41,9 +41,9 @@ class DINOv2(nn.Module):
 
 def dino_transform(): 
     return transforms.Compose([
-    transforms.Resize(int(518), 
+    transforms.Resize(int(378), 
                      interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(518),
+    transforms.CenterCrop(378),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                         std=[0.229, 0.224, 0.225])
@@ -140,11 +140,12 @@ def megaloc_transform():
     """
     MegaLoc uses standard ImageNet normalization (same as DINOv2)
     Can use flexible resolutions divisible by 14
+    Reduced resolution for memory efficiency
     """
     return transforms.Compose([
-        transforms.Resize(518,  # Or 378, 434, etc. (divisible by 14)
+        transforms.Resize(378,  # Or 378, 434, etc. (divisible by 14)
                          interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(518),
+        transforms.CenterCrop(378),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                             std=[0.229, 0.224, 0.225])

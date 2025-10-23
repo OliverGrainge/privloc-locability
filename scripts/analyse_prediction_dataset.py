@@ -8,6 +8,9 @@ This script loads a prediction dataset and generates various statistics and visu
 - Coordinate distribution plots
 - Accuracy heatmaps
 - Error statistics
+
+The script supports random subsampling of the dataset for faster analysis of large datasets.
+Use --subsample N to randomly select N samples from the dataset.
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,6 +32,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.datasets import load_prediction_dataset
 from torchvision import transforms
+import torch
 
 
 def haversine_distance(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
@@ -114,10 +118,11 @@ def plot_error_distribution(true_lat: np.ndarray, true_lon: np.ndarray,
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
     # Histogram
-    ax1.hist(distances, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
+    # Normalized histogram on left, log-normalized on right
+    ax1.hist(distances, bins=50, alpha=0.7, color='skyblue', edgecolor='black', density=True)
     ax1.set_xlabel('Geodetic Error (km)')
-    ax1.set_ylabel('Frequency')
-    ax1.set_title('Distribution of Geodetic Errors')
+    ax1.set_ylabel('Density')
+    ax1.set_title('Distribution of Geodetic Errors (Normalized)')
     ax1.grid(True, alpha=0.3)
     
     # Add statistics
@@ -127,11 +132,11 @@ def plot_error_distribution(true_lat: np.ndarray, true_lon: np.ndarray,
     ax1.axvline(median_error, color='orange', linestyle='--', label=f'Median: {median_error:.2f} km')
     ax1.legend()
     
-    # Log scale histogram
-    ax2.hist(distances, bins=50, alpha=0.7, color='lightcoral', edgecolor='black')
+    # Log scale histogram (also normalized)
+    ax2.hist(distances, bins=50, alpha=0.7, color='lightcoral', edgecolor='black', density=True)
     ax2.set_xlabel('Geodetic Error (km)')
-    ax2.set_ylabel('Frequency')
-    ax2.set_title('Distribution of Geodetic Errors (Log Scale)')
+    ax2.set_ylabel('Density')
+    ax2.set_title('Distribution of Geodetic Errors (Log Scale, Normalized)')
     ax2.set_yscale('log')
     ax2.grid(True, alpha=0.3)
     
@@ -248,6 +253,95 @@ def generate_summary_statistics(true_lat: np.ndarray, true_lon: np.ndarray,
     return stats
 
 
+def plot_best_worst_predictions(dataset, true_lat: np.ndarray, true_lon: np.ndarray, 
+                               pred_lat: np.ndarray, pred_lon: np.ndarray, 
+                               output_path: str, n_samples: int = 8):
+    """
+    Create a figure showing images with the smallest and largest prediction errors.
+    
+    Args:
+        dataset: The prediction dataset containing images
+        true_lat, true_lon: True coordinates
+        pred_lat, pred_lon: Predicted coordinates  
+        output_path: Path to save the figure
+        n_samples: Number of samples to show for best and worst (default: 8)
+    """
+    # Calculate errors for all samples
+    distances = haversine_distance(true_lat, true_lon, pred_lat, pred_lon)
+    
+    # Get indices of best and worst predictions
+    best_indices = np.argsort(distances)[:n_samples]
+    worst_indices = np.argsort(distances)[-n_samples:]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, n_samples, figsize=(n_samples * 2, 6))
+    if n_samples == 1:
+        axes = axes.reshape(2, 1)
+    
+    # Set up transform to convert images back to displayable format
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+    
+    # Plot best predictions (top row)
+    for i, idx in enumerate(best_indices):
+        try:
+            # Get the sample from dataset
+            sample = dataset[idx]
+            image = sample['image']
+            
+            # Convert tensor back to PIL image for display
+            if isinstance(image, torch.Tensor):
+                # Denormalize if needed (assuming ImageNet normalization)
+                if image.min() < 0:  # Likely normalized
+                    image = image * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                image = transforms.ToPILImage()(image)
+            
+            axes[0, i].imshow(image)
+            axes[0, i].set_title(f'Error: {distances[idx]:.2f} km', fontsize=10)
+            axes[0, i].axis('off')
+        except Exception as e:
+            axes[0, i].text(0.5, 0.5, f'Error loading\nimage {idx}', 
+                           ha='center', va='center', transform=axes[0, i].transAxes)
+            axes[0, i].axis('off')
+    
+    # Plot worst predictions (bottom row)
+    for i, idx in enumerate(worst_indices):
+        try:
+            # Get the sample from dataset
+            sample = dataset[idx]
+            image = sample['image']
+            
+            # Convert tensor back to PIL image for display
+            if isinstance(image, torch.Tensor):
+                # Denormalize if needed (assuming ImageNet normalization)
+                if image.min() < 0:  # Likely normalized
+                    image = image * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                image = transforms.ToPILImage()(image)
+            
+            axes[1, i].imshow(image)
+            axes[1, i].set_title(f'Error: {distances[idx]:.2f} km', fontsize=10)
+            axes[1, i].axis('off')
+        except Exception as e:
+            axes[1, i].text(0.5, 0.5, f'Error loading\nimage {idx}', 
+                           ha='center', va='center', transform=axes[1, i].transAxes)
+            axes[1, i].axis('off')
+    
+    # Add row labels
+    fig.text(0.02, 0.75, 'Best Predictions\n(Smallest Errors)', 
+             rotation=90, va='center', ha='center', fontsize=12, fontweight='bold')
+    fig.text(0.02, 0.25, 'Worst Predictions\n(Largest Errors)', 
+             rotation=90, va='center', ha='center', fontsize=12, fontweight='bold')
+    
+    plt.suptitle('Image Samples: Best vs Worst Predictions', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.subplots_adjust(left=0.08)  # Make room for row labels
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def save_statistics(stats: dict, output_path: str):
     """Save statistics to a text file."""
     with open(output_path, 'w') as f:
@@ -281,7 +375,10 @@ def main():
     parser.add_argument('model_name', help='Name of the model (e.g., geoclip)')
     parser.add_argument('--output_dir', default='predictions', help='Directory containing prediction files')
     parser.add_argument('--max_samples', type=int, help='Maximum number of samples to analyze (for debugging)')
+    parser.add_argument('--subsample', type=int, help='Number of samples to randomly subsample from the dataset')
+    parser.add_argument('--random_seed', type=int, default=42, help='Random seed for reproducible subsampling (default: 42)')
     parser.add_argument('--plots_dir', default='plots', help='Directory to save plots')
+    parser.add_argument('--n_best_worst', type=int, default=8, help='Number of best and worst samples to show in visualization (default: 8)')
     
     args = parser.parse_args()
     
@@ -304,22 +401,58 @@ def main():
         print(f"Error loading dataset: {e}")
         return
     
-    # Extract coordinates
+    # Apply subsampling if requested
+    if args.subsample is not None:
+        if args.subsample > len(dataset):
+            print(f"Warning: Requested subsample size ({args.subsample}) is larger than dataset size ({len(dataset)}). Using full dataset.")
+        else:
+            print(f"Will subsample first {args.subsample} samples sequentially from files")
+            # We'll handle subsampling during coordinate extraction to keep it sequential
+    
+    # Extract coordinates using sequential file access for efficiency
     print("Extracting coordinates...")
     true_lats = []
     true_lons = []
     pred_lats = []
     pred_lons = []
     
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        true_lats.append(sample['true_lat'].item())
-        true_lons.append(sample['true_lon'].item())
-        pred_lats.append(sample['pred_lat'].item())
-        pred_lons.append(sample['pred_lon'].item())
+    # Use sequential file access to avoid random file loading
+    if hasattr(dataset, 'get_file_samples'):
+        # Use the new efficient method with sequential subsampling
+        total_processed = 0
+        target_samples = args.subsample if args.subsample is not None else len(dataset)
         
-        if (i + 1) % 1000 == 0:
-            print(f"Processed {i + 1}/{len(dataset)} samples")
+        for file_idx in range(len(dataset.parquet_files)):
+            if total_processed >= target_samples:
+                break
+                
+            
+            samples = dataset.get_file_samples(file_idx)
+            
+            for sample in samples:
+                if total_processed >= target_samples:
+                    break
+                if total_processed % 1000 == 0:
+                    print(f"Processing Dataset {total_processed/target_samples*100:.2f}%")
+                true_lats.append(sample['true_lat'].item())
+                true_lons.append(sample['true_lon'].item())
+                pred_lats.append(sample['pred_lat'].item())
+                pred_lons.append(sample['pred_lon'].item())
+                total_processed += 1
+                
+        print(f"Sequentially processed {total_processed} samples from {file_idx + 1} files")
+    else:
+        # Fallback to original method
+        target_samples = args.subsample if args.subsample is not None else len(dataset)
+        for i in range(min(len(dataset), target_samples)):
+            sample = dataset[i]
+            true_lats.append(sample['true_lat'].item())
+            true_lons.append(sample['true_lon'].item())
+            pred_lats.append(sample['pred_lat'].item())
+            pred_lons.append(sample['pred_lon'].item())
+            
+            if (i + 1) % 1000 == 0:
+                print(f"Processed {i + 1}/{target_samples} samples ({i + 1 / target_samples * 100:.2f}%)")
     
     true_lat = np.array(true_lats)
     true_lon = np.array(true_lons)
@@ -354,6 +487,10 @@ def main():
     # Error heatmap
     plot_error_heatmap(true_lat, true_lon, pred_lat, pred_lon, plots_dir / 'error_heatmap.png')
     print("✓ Error heatmap saved")
+    
+    # Best and worst predictions visualization
+    plot_best_worst_predictions(dataset, true_lat, true_lon, pred_lat, pred_lon, plots_dir / 'best_worst_predictions.png', n_samples=args.n_best_worst)
+    print("✓ Best/worst predictions visualization saved")
     
     print(f"\nAnalysis complete! All plots saved to: {plots_dir}")
     print(f"Key statistics:")
