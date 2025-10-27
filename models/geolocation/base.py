@@ -144,4 +144,3 @@ class GeoLocationModel(nn.Module, ABC):
             'trainable_parameters': trainable_params,
             'device': next(self.parameters()).device if total_params > 0 else 'cpu'
         }
-

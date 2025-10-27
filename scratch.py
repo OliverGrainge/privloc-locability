@@ -1,343 +1,116 @@
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import glob
+from io import BytesIO
+from typing import Optional, Callable, List, Dict, Any
+
+import msgpack
 import torch
+from torch.utils.data import Dataset
 from PIL import Image
-import numpy as np
-
-
-
-
-
-
-import torch 
-import torch.nn as nn 
-import timm
 from torchvision import transforms
+from tqdm import tqdm
 
-class MLPRegressor(nn.Module):
-    def __init__(self, in_dim, hidden=768, dropout=0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), 
-            nn.GELU(), 
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden), 
-            nn.GELU(), 
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1)
-        )
+
+
+class OSV5MDataset(Dataset):
+    """
+    PyTorch Dataset for loading geotagged images from OSV5M using Hugging Face datasets.
     
-    def forward(self, x):
-        out = self.net(x).squeeze(-1)
-        return torch.nn.functional.softplus(out)  # Ensures log(1+e) >= 0
-
-
-class DINOv2(nn.Module): 
-    def __init__(self): 
-        super().__init__()
-        import timm 
-        self.backbone = timm.create_model('vit_base_patch14_dinov2.lvd142m', 
-                                         pretrained=True, num_classes=0)
-        
-        # Unfreeze for fine-tuning
-        for param in self.backbone.parameters():
-            param.requires_grad = True
-        
-        embed_dim = self.backbone.num_features
-        self.head = MLPRegressor(embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor: 
-        features = self.backbone(x)
-        return self.head(features)
-
-def dino_transform(): 
-    return transforms.Compose([
-    transforms.Resize(int(518), 
-                     interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(518),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                        std=[0.229, 0.224, 0.225])
-])
+    Each record contains:
+        - 'image': PIL Image
+        - 'latitude': latitude coordinate
+        - 'longitude': longitude coordinate
+        - Additional metadata fields
+    """
     
-
-class SigLip(nn.Module):
-    def __init__(self):
-        super().__init__()
-        import timm
+    def __init__(
+        self,
+        transform: Optional[Callable],
+        split: str = "train",
+        streaming: bool = False,
+        max_samples: Optional[int] = None
+    ):
+        """
+        Args:
+            transform: Optional torchvision transform to apply to images
+            split: Dataset split to load (e.g., 'train', 'test', 'validation')
+            streaming: Whether to stream the dataset (useful for very large datasets)
+            max_samples: Optional limit on number of samples to load (useful for debugging)
+        """
+        self.transform = transform
+        self.streaming = streaming
         
-        # Create SigLip model from timm
-        self.backbone = timm.create_model(
-            'vit_so400m_patch14_siglip_384', 
-            pretrained=True, 
-            num_classes=0  # Remove classification head
+        print(f"Loading OSV5M dataset (split: {split})...")
+        
+        # Load dataset from Hugging Face
+        self.dataset = load_dataset(
+            "osv5m/osv5m",
+            split=split,
+            streaming=streaming
         )
         
-        # Unfreeze for fine-tuning
-        for param in self.backbone.parameters():
-            param.requires_grad = True
-        
-        # Get embedding dimension
-        self.num_features = self.backbone.num_features
-        embed_dim = self.num_features
-        self.head = MLPRegressor(embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)
-        return self.head(features)
-
-
-def siglip_transform():
-    """
-    SigLIP uses different normalization than ImageNet models.
-    Mean/std are calculated to map [0, 255] -> [-1, 1]
-    """
-    return transforms.Compose([
-        transforms.Resize(384, 
-                         interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(384),
-        transforms.ToTensor(),
-        # SigLIP normalization (maps to [-1, 1] range)
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], 
-                            std=[0.5, 0.5, 0.5])
-    ])
-
-
-class MegaLoc(nn.Module): 
-    def __init__(self, freeze_first_n_blocks=6): 
-        super().__init__()
-        
-        # Load pretrained MegaLoc
-        megaloc_model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
-        
-        self.backbone = megaloc_model.backbone
-        self.aggregator = megaloc_model.aggregator
-        
-        # Freeze first N blocks (12 blocks total for DINOv2 Base)
-        for i, block in enumerate(self.backbone.model.blocks):
-            if i < freeze_first_n_blocks:
-                for param in block.parameters():
-                    param.requires_grad = False
-            else:
-                for param in block.parameters():
-                    param.requires_grad = True
-        
-        # Freeze patch embedding
-        for param in self.backbone.model.patch_embed.parameters():
-            param.requires_grad = False
-        
-        # Unfreeze aggregator
-        for param in self.aggregator.parameters():
-            param.requires_grad = True
-        
-        embed_dim = megaloc_model.feat_dim  # 8448
-        self.head = MLPRegressor(embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        if h % 14 != 0 or w % 14 != 0:
-            h = round(h / 14) * 14
-            w = round(w / 14) * 14
-            x = torch.nn.functional.interpolate(
-                x, size=(h, w), mode='bilinear', 
-                align_corners=False, antialias=True
-            )
-        
-        features = self.backbone(x)
-        features = self.aggregator(features)
-        return self.head(features)
-
-def megaloc_transform():
-    """
-    MegaLoc uses standard ImageNet normalization (same as DINOv2)
-    Can use flexible resolutions divisible by 14
-    """
-    return transforms.Compose([
-        transforms.Resize(518,  # Or 378, 434, etc. (divisible by 14)
-                         interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(518),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                            std=[0.229, 0.224, 0.225])
-    ])
+        # If not streaming and max_samples is specified, truncate
+        if not streaming and max_samples:
+            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
+            print(f"Limited to {len(self.dataset)} samples")
+        elif not streaming:
+            print(f"Total records: {len(self.dataset)}")
+        else:
+            print("Streaming mode enabled")
     
-
-def load_arch_and_transform(arch_name: str, **kwargs):
-    """
-    Load architecture by name.
+    def __len__(self) -> int:
+        if self.streaming:
+            raise NotImplementedError("Length is not available in streaming mode")
+        return len(self.dataset)
     
-    Args:
-        arch_name: Name of the architecture ('dinov2', 'siglip')
-        **kwargs: Additional arguments for architecture initialization
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Get a single item from the dataset.
+
+        Returns:
+            Dictionary containing:
+                - 'image': transformed image tensor
+                - 'latitude': latitude value (float)
+                - 'longitude': longitude value (float)
+                - 'image_bytes': raw image bytes
+                - 'idx': dataset index (int) - can be used to retrieve this same item again
+        """
+        if self.streaming:
+            raise NotImplementedError("Indexing is not available in streaming mode. Iterate over the dataset instead.")
         
-    Returns:
-        Initialized model
-    """
-    if arch_name.lower() == 'dinov2':
-        return DINOv2(**kwargs), dino_transform()
-    elif arch_name.lower() == 'siglip':
-        return SigLip(**kwargs), siglip_transform()
-    elif arch_name.lower() == 'megaloc':
-        return MegaLoc(**kwargs), megaloc_transform()
-    else:
-        raise ValueError(f"Unknown architecture: {arch_name}. Available: dinov2, siglip")
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
 
-
-
-
-def create_dummy_image(size=(518, 518)):
-    """Create a dummy RGB image for testing"""
-    img_array = np.random.randint(0, 255, (size[1], size[0], 3), dtype=np.uint8)
-    return Image.fromarray(img_array)
-
-def test_model(arch_name, model, transform, batch_size=2):
-    """Test a single model architecture"""
-    print(f"\n{'='*60}")
-    print(f"Testing {arch_name.upper()}")
-    print(f"{'='*60}")
-    
-    try:
-        # Check model is in correct mode
-        model.eval()
-        print(f"✓ Model initialized successfully")
+        record = self.dataset[idx]
         
-        # Count parameters
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"✓ Total parameters: {total_params:,}")
-        print(f"✓ Trainable parameters: {trainable_params:,}")
+        # Get the PIL Image (already decoded by HF datasets)
+        image = record['image']
         
-        # Create dummy images
-        images = [create_dummy_image() for _ in range(batch_size)]
-        print(f"✓ Created {batch_size} dummy images")
+        # Convert to bytes if needed
+        buffer = BytesIO()
+        image.save(buffer, format='JPEG')
+        image_bytes = buffer.getvalue()
         
-        # Apply transforms
-        transformed = torch.stack([transform(img) for img in images])
-        print(f"✓ Transform output shape: {transformed.shape}")
-        print(f"✓ Transform output range: [{transformed.min():.3f}, {transformed.max():.3f}]")
-        
-        # Test forward pass
-        with torch.no_grad():
-            output = model(transformed)
-        
-        print(f"✓ Forward pass successful")
-        print(f"✓ Output shape: {output.shape}")
-        print(f"✓ Output values: {output}")
-        print(f"✓ Output range: [{output.min():.3f}, {output.max():.3f}]")
-        
-        # Check output is non-negative (due to softplus)
-        assert (output >= 0).all(), "Output should be non-negative due to softplus"
-        print(f"✓ All outputs are non-negative (softplus working)")
-        
-        # Test gradient flow
-        model.train()
-        output_train = model(transformed)
-        loss = output_train.sum()
-        loss.backward()
-        
-        # Check if gradients exist for trainable parameters
-        grad_exists = any(p.grad is not None for p in model.parameters() if p.requires_grad)
-        assert grad_exists, "No gradients found for trainable parameters"
-        print(f"✓ Gradient flow verified")
-        
-        print(f"\n✓ {arch_name.upper()} PASSED ALL TESTS")
-        return True
-        
-    except Exception as e:
-        print(f"\n✗ {arch_name.upper()} FAILED: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
+        # Apply transform
+        if self.transform:
+            image = self.transform(image)
 
-def test_load_function():
-    """Test the load_arch_and_transform function"""
-    print(f"\n{'='*60}")
-    print(f"Testing load_arch_and_transform() function")
-    print(f"{'='*60}")
-    
-    results = {}
-    
-    for arch_name in ['dinov2', 'siglip', 'megaloc']:
-        try:
-            print(f"\nLoading {arch_name}...")
-            model, transform = load_arch_and_transform(arch_name)
-            print(f"✓ Successfully loaded {arch_name}")
-            results[arch_name] = True
-        except Exception as e:
-            print(f"✗ Failed to load {arch_name}: {str(e)}")
-            results[arch_name] = False
-    
-    return results
-
-def main():
-    print("Starting model tests...")
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    
-    # Device configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    results = {}
-    
-    # Test 1: DINOv2
-    try:
-        print("\n" + "="*60)
-        print("TEST 1: Loading DINOv2")
-        print("="*60)
-        model, transform = load_arch_and_transform('dinov2')
-        model = model.to(device)
-        results['dinov2'] = test_model('dinov2', model, transform)
-    except Exception as e:
-        print(f"✗ DINOv2 loading failed: {str(e)}")
-        results['dinov2'] = False
+        return {
+            'image_bytes': image_bytes,
+            'image': image,
+            'lat': torch.tensor(float(record['latitude'])),
+            'lon': torch.tensor(float(record['longitude'])),
+        }
 
 
-    # Test 2: SigLIP
-    try:
-        print("\n" + "="*60)
-        print("TEST 2: Loading SigLIP")
-        print("="*60)
-        model, transform = load_arch_and_transform('siglip')
-        model = model.to(device)
-        results['siglip'] = test_model('siglip', model, transform)
-    except Exception as e:
-        print(f"✗ SigLIP loading failed: {str(e)}")
-        results['siglip'] = False
-    
-    
 
-    # Test 3: MegaLoc
-    try:
-        print("\n" + "="*60)
-        print("TEST 3: Loading MegaLoc")
-        print("="*60)
-        model, transform = load_arch_and_transform('megaloc')
-        model = model.to(device)
-        results['megaloc'] = test_model('megaloc', model, transform)
-    except Exception as e:
-        print(f"✗ MegaLoc loading failed: {str(e)}")
-        results['megaloc'] = False
-    
-    # Test 4: load_arch_and_transform function
-    load_results = test_load_function()
-    
-    # Summary
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    for name, passed in results.items():
-        status = "✓ PASSED" if passed else "✗ FAILED"
-        print(f"{name.upper():15s}: {status}")
-    
-    all_passed = all(results.values())
-    print(f"\n{'='*60}")
-    if all_passed:
-        print("ALL TESTS PASSED! ✓")
-    else:
-        print("SOME TESTS FAILED! ✗")
-    print(f"{'='*60}")
-    
-    return all_passed
 
-if __name__ == "__main__":
-    success = main()
-    exit(0 if success else 1)
+if __name__ == "__main__": 
+    ds = OSV5MDataset(transform=transforms.ToTensor())
+    batch = next(iter(ds))
+    print(batch.keys())
+    print(batch['image'].shape)
+    print(batch['lat'])
+    print(batch['lon'])

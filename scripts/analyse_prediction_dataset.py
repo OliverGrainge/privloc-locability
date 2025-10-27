@@ -371,7 +371,7 @@ def save_statistics(stats: dict, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze prediction dataset')
-    parser.add_argument('dataset_name', help='Name of the dataset (e.g., yfcc100m)')
+    parser.add_argument('dataset_name', help='Name of the dataset (e.g., mp16)')
     parser.add_argument('model_name', help='Name of the model (e.g., geoclip)')
     parser.add_argument('--output_dir', default='predictions', help='Directory containing prediction files')
     parser.add_argument('--max_samples', type=int, help='Maximum number of samples to analyze (for debugging)')

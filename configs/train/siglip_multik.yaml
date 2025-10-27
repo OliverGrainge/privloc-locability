@@ -1,7 +1,7 @@
 
 model: 
   arch_name: "siglip"
-  dataset_name: "yfcc100m"
+  dataset_name: "mp16"
   pred_model_name: "geoclip"
   head_type: "multik"
   K_km: [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]

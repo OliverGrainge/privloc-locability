@@ -2,7 +2,7 @@
 
 model: 
   arch_name: "megaloc"
-  dataset_name: "yfcc100m"
+  dataset_name: "mp16"
   pred_model_name: "geoclip"
   learning_rate: 0.0001
   weight_decay: 0.0

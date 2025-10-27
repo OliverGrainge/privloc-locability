@@ -1,9 +1,9 @@
-from data.datasets.geodataset import YFCC100MDataset
+from data.datasets.geodataset import MP16Dataset
 from data.datasets.predictiongeodataset import PredictionGeoDataset
 
 def load_dataset(dataset_name: str, **kwargs): 
-    if dataset_name == "yfcc100m":
-        return YFCC100MDataset(**kwargs)
+    if dataset_name == "mp16":
+        return MP16Dataset(**kwargs)
     else:
         raise ValueError(f"Dataset {dataset_name} not found")
 
@@ -12,7 +12,7 @@ def load_prediction_dataset(dataset_name: str, model_name: str, output_dir: str 
     Load a prediction dataset from parquet files (single file or sharded files).
     
     Args:
-        dataset_name: Name of the dataset (e.g., 'yfcc100m')
+        dataset_name: Name of the dataset (e.g., 'mp16')
         model_name: Name of the model used for predictions (e.g., 'geoclip')
         output_dir: Directory containing prediction files (defaults to 'predictions')
         **kwargs: Additional arguments passed to PredictionGeoDataset

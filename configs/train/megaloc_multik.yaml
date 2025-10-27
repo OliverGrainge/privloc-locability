@@ -1,7 +1,7 @@
 
 model: 
   arch_name: "megaloc"
-  dataset_name: "yfcc100m"
+  dataset_name: "mp16"
   pred_model_name: "geoclip"
   head_type: "multik"
   K_km: [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
@@ -15,17 +15,13 @@ model:
   batch_size: 32
   num_workers: 8
 
-  
 trainer: 
-  max_steps: 100000
+  max_steps: 500000
   precision: 'bf16-mixed' 
   accelerator: 'auto'
   devices: 'auto'
   strategy: 'auto'
-  log_every_n_steps: 10
   enable_progress_bar: False
-  check_val_every_n_epoch: 0 
-
 
 
 checkpoint: True 

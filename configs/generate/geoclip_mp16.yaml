@@ -1,4 +1,4 @@
-# Example Ray Tune configuration YAML for a GeoCLIP + YFCC100M generation run
+# Example Ray Tune configuration YAML for a GeoCLIP + MP16 generation run
 
 ray:
   # Configuration for Ray cluster (local or remote)
@@ -6,8 +6,8 @@ ray:
 
 parameters:
   model_name: geoclip
-  dataset_name: yfcc100m
+  dataset_name: mp16
   transform_name: geoclip
-  batch_size: 128
+  batch_size: 256
   num_workers: 6
-  max_shards: 20  
+  max_shards: null

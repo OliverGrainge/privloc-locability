@@ -384,7 +384,7 @@ def main():
         parameters.dataset_name,
         parameters.model_name,
         save_interval=500,
-        shard_size=20000,  # 50K samples per shard (adjust as needed)
+        shard_size=50000,  # 50K samples per shard (adjust as needed)
         log_dir=log_dir
     )
     
