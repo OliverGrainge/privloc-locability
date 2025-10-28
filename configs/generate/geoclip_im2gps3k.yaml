@@ -1,0 +1,14 @@
+# Example Ray Tune configuration YAML for a GeoCLIP + MP16 generation run
+
+ray:
+  # Configuration for Ray cluster (local or remote)
+  address: null         # Use 'auto' for Ray on cluster, or null for local
+
+parameters:
+  model_name: geoclip
+  dataset_name: im2gps3k
+  transform_name: geoclip
+  batch_size: 16
+  num_workers: 6
+  max_shards: null
+  embeddings: True

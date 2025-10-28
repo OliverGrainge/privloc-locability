@@ -16,6 +16,9 @@ import logging
 from pathlib import Path
 import socket
 import shutil
+import numpy as np
+import pandas as pd
+from PIL import Image
 
 
 # Configure logging for SLURM cluster (single node, multi-GPU)
@@ -104,17 +107,41 @@ def setup_ray_actor_logging(actor_name, log_dir="logs", log_level=logging.INFO):
 logger = setup_logging()
 
 
+def load_siglip_encoder(device):
+    """
+    Load SigLip vision encoder for generating image embeddings
+    Returns the model and its transform
+    """
+    try:
+        from transformers import AutoModel, AutoProcessor
+        
+        model_name = "google/siglip-so400m-patch14-384"
+        
+        # Load processor and model
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        
+        # Extract vision model and move to device
+        vision_model = model.vision_model.to(device)
+        vision_model.eval()
+        
+        return vision_model, processor
+    except Exception as e:
+        raise RuntimeError(f"Failed to load SigLip encoder: {e}")
+
+
 @ray.remote
 class ParquetWriter:
     """Handles writing predictions to sharded Parquet files"""
     
     def __init__(self, output_dir, dataset_name, model_name, save_interval=100, 
-                 shard_size=100, log_dir="logs"):
+                 shard_size=100, log_dir="logs", include_embeddings=False):
         self.output_dir = Path(output_dir)
         self.dataset_name = dataset_name
         self.model_name = model_name
         self.save_interval = save_interval
         self.shard_size = shard_size  # Number of samples per shard
+        self.include_embeddings = include_embeddings
         self.batch_count = 0
         self.total_samples_written = 0
         self.current_shard = 0
@@ -135,7 +162,8 @@ class ParquetWriter:
         
         self.pending_results = []
         
-        self.logger.info(f"Initialized with shard_size={shard_size}, shard_dir={self.shard_dir}")
+        embeddings_status = "enabled" if include_embeddings else "disabled"
+        self.logger.info(f"Initialized with shard_size={shard_size}, embeddings={embeddings_status}, shard_dir={self.shard_dir}")
         self.logger.info("Ready to start generating predictions with sharding enabled")
         
     def add_results(self, batch_results):
@@ -213,7 +241,8 @@ class ParquetWriter:
             'total_samples_written': self.total_samples_written,
             'current_shard': self.current_shard,
             'samples_in_current_shard': self.samples_in_current_shard,
-            'shard_dir': str(self.shard_dir)
+            'shard_dir': str(self.shard_dir),
+            'include_embeddings': self.include_embeddings
         }
 
 
@@ -221,9 +250,10 @@ class ParquetWriter:
 class PredictionWorker:
     """Ray actor that runs predictions on a single GPU"""
     
-    def __init__(self, config, worker_id, log_dir="logs"):
+    def __init__(self, config, worker_id, log_dir="logs", include_embeddings=False):
         self.config = config
         self.worker_id = worker_id
+        self.include_embeddings = include_embeddings
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
         # Setup logger for this worker
@@ -232,13 +262,52 @@ class PredictionWorker:
         cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
         self.logger.info(f"Starting initialization - Device: {self.device}, CUDA_VISIBLE_DEVICES: {cuda_visible}")
         
-        # Load model
+        # Load geolocation model
         parameters = config.parameters
         self.logger.info(f"Loading model: {parameters.model_name}")
         self.model = load_model(parameters.model_name)
         self.model = self.model.to(self.device)
         self.model.eval()
-        self.logger.info(f"Initialization complete on {self.device}")
+        
+        # Load SigLip encoder if embeddings are requested
+        self.siglip_model = None
+        self.siglip_processor = None
+        if include_embeddings:
+            self.logger.info("Loading SigLip encoder for embeddings...")
+            self.siglip_model, self.siglip_processor = load_siglip_encoder(self.device)
+            self.logger.info("SigLip encoder loaded successfully")
+        
+        embeddings_status = "enabled" if include_embeddings else "disabled"
+        self.logger.info(f"Initialization complete on {self.device} (embeddings: {embeddings_status})")
+    
+    def _generate_siglip_embedding(self, images_pil):
+        """
+        Generate SigLip embeddings for a batch of PIL images
+        
+        Args:
+            images_pil: List of PIL Image objects
+            
+        Returns:
+            numpy array of embeddings [batch_size, embedding_dim]
+        """
+        # Process images with SigLip processor
+        inputs = self.siglip_processor(
+            images=images_pil, 
+            return_tensors="pt"
+        )
+        
+        # Move to device
+        pixel_values = inputs['pixel_values'].to(self.device)
+        
+        # Generate embeddings
+        with torch.no_grad():
+            outputs = self.siglip_model(pixel_values)
+            # Get pooled output (CLS token representation)
+            embeddings = outputs.pooler_output
+            # L2 normalize
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        return embeddings.cpu().numpy()
     
     def predict_range(self, start_idx, end_idx, writer):
         """Process a range of dataset indices [start_idx, end_idx)"""
@@ -277,23 +346,41 @@ class PredictionWorker:
             true_lat = batch['lat'].cpu().numpy()
             true_lon = batch['lon'].cpu().numpy()
             
-            # Get predictions
+            # Get geolocation predictions
             with torch.no_grad():
                 pred_lat, pred_lon = self.model(images)
                 pred_lat = pred_lat.cpu().numpy()
                 pred_lon = pred_lon.cpu().numpy()
             
+            # Generate SigLip embeddings if requested
+            embeddings = None
+            if self.include_embeddings:
+                # Convert image bytes back to PIL images for SigLip processing
+                images_pil = []
+                for img_bytes in image_bytes:
+                    from io import BytesIO
+                    pil_image = Image.open(BytesIO(img_bytes)).convert('RGB')
+                    images_pil.append(pil_image)
+                embeddings = self._generate_siglip_embedding(images_pil)
+            
             # Prepare batch results as list of dicts
             batch_results = []
             
             for i in range(len(image_bytes)):
-                batch_results.append({
+                result = {
                     'image_bytes': image_bytes[i],
                     'true_lat': float(true_lat[i]),
                     'true_lon': float(true_lon[i]),
                     'pred_lat': float(pred_lat[i]),
                     'pred_lon': float(pred_lon[i])
-                })
+                }
+                
+                # Add embedding if available
+                if embeddings is not None:
+                    # Store embedding as bytes for efficient parquet storage
+                    result['embedding'] = embeddings[i].tobytes()
+                
+                batch_results.append(result)
             
             # Send to writer
             ray.get(writer.add_results.remote(batch_results))
@@ -304,12 +391,15 @@ class PredictionWorker:
 
 def main():
     if len(sys.argv) < 2:
-        raise ValueError("Usage: python generate_distributed.py <config.yaml> [start_idx] [end_idx]")
+        raise ValueError("Usage: python generate.py <config.yaml> [start_idx] [end_idx]")
     
     config_path = sys.argv[1]
     config = load_config_yaml(config_path)
     parameters = config.parameters
     ray_config = config.ray
+    
+    # Check if embeddings should be included
+    include_embeddings = getattr(parameters, 'embeddings', False)
     
     # Get log directory and output directory from config or use defaults
     log_dir = getattr(config, 'log_dir', 'logs')
@@ -322,6 +412,7 @@ def main():
     
     logger.info(f"SLURM Job ID: {os.environ.get('SLURM_JOB_ID', 'N/A')}")
     logger.info(f"Configuration loaded from {config_path}")
+    logger.info(f"Embeddings enabled: {include_embeddings}")
     logger.info(f"Logs directory: {log_dir}")
     if dataset_dir:
         logger.info(f"Using DATASET_DIR environment variable: {dataset_dir}")
@@ -385,14 +476,17 @@ def main():
         parameters.model_name,
         save_interval=500,
         shard_size=50000,  # 50K samples per shard (adjust as needed)
-        log_dir=log_dir
+        log_dir=log_dir,
+        include_embeddings=include_embeddings
     )
     
     # Create workers
     logger.info("Creating prediction workers...")
     workers = []
     for i in range(num_gpus):
-        worker = PredictionWorker.options(num_gpus=1).remote(config, i, log_dir)
+        worker = PredictionWorker.options(num_gpus=1).remote(
+            config, i, log_dir, include_embeddings
+        )
         workers.append(worker)
     
     # Distribute work
@@ -422,6 +516,8 @@ def main():
     
     stats = ray.get(writer.get_stats.remote())
     logger.info(f"All predictions saved to {stats['current_shard'] + 1} shard files in: {stats['shard_dir']}")
+    if include_embeddings:
+        logger.info("Embeddings included in output parquet files")
     
     # Shutdown
     ray.shutdown()

@@ -1,9 +1,14 @@
 from data.datasets.geodataset import MP16Dataset
+from data.datasets.geodataset import YFCC4kDataset, Im2GPS3kDataset
 from data.datasets.predictiongeodataset import PredictionGeoDataset
 
 def load_dataset(dataset_name: str, **kwargs): 
     if dataset_name == "mp16":
         return MP16Dataset(**kwargs)
+    elif dataset_name == "yfcc4k":
+        return YFCC4kDataset(**kwargs)
+    elif dataset_name == "im2gps3k":
+        return Im2GPS3kDataset(**kwargs)
     else:
         raise ValueError(f"Dataset {dataset_name} not found")
 
