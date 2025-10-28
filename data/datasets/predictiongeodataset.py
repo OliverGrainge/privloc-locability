@@ -8,6 +8,7 @@ from typing import Optional, Callable, Union, List
 from pathlib import Path
 import glob
 from tqdm import tqdm 
+from torchvision import transforms
 
 
 class PredictionGeoDataset(Dataset):
@@ -21,6 +22,7 @@ class PredictionGeoDataset(Dataset):
         - 'true_lon': true longitude coordinate
         - 'pred_lat': predicted latitude coordinate
         - 'pred_lon': predicted longitude coordinate
+        - 'embedding': image embedding (optional, if generated with embeddings=True)
     """
     
     def __init__(
@@ -37,7 +39,7 @@ class PredictionGeoDataset(Dataset):
             max_samples: Optional limit on number of samples to load (useful for debugging)
         """
         self.parquet_path = Path(parquet_path)
-        self.transform = transform
+        self.transform = transform if transform is not None else self._default_transform()
         self.max_samples = max_samples
         
         # Determine if we have a single file or sharded files
@@ -63,6 +65,9 @@ class PredictionGeoDataset(Dataset):
         self.next_file_df = None
         self.next_file_idx = None
         
+        # Embedding state
+        self.has_embeddings = False
+        
         # Calculate file start indices and total samples without loading data
         print(f"Scanning {len(self.parquet_files)} parquet file(s) for metadata")
         for i, file_path in enumerate(self.parquet_files):
@@ -86,6 +91,21 @@ class PredictionGeoDataset(Dataset):
             missing_columns = [col for col in required_columns if col not in sample_df.columns]
             if missing_columns:
                 raise ValueError(f"Missing required columns in parquet file: {missing_columns}")
+            
+            # Check if embeddings are present
+            if 'embedding' in sample_df.columns:
+                self.has_embeddings = True
+                print("Embeddings detected in parquet files")
+            else:
+                print("No embeddings found in parquet files")
+
+    def _default_transform(self):
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
     
     def _load_file_if_needed(self, file_idx: int):
         """Load a parquet file if it's not currently loaded."""
@@ -171,14 +191,25 @@ class PredictionGeoDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
             
-            samples.append({
+            sample = {
                 'image': image,
                 'true_lat': torch.tensor(float(row['true_lat'])),
                 'true_lon': torch.tensor(float(row['true_lon'])),
                 'pred_lat': torch.tensor(float(row['pred_lat'])),
                 'pred_lon': torch.tensor(float(row['pred_lon'])),
                 'idx': torch.tensor(global_idx)
-            })
+            }
+            
+            # Add embedding if available
+            if self.has_embeddings and 'embedding' in row:
+                # Convert bytes back to numpy array
+                import numpy as np
+                embedding_bytes = row['embedding']
+                if isinstance(embedding_bytes, bytes):
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    sample['embedding'] = torch.tensor(embedding)
+            
+            samples.append(sample)
         
         return samples
     
@@ -201,6 +232,7 @@ class PredictionGeoDataset(Dataset):
                 - 'pred_lat': predicted latitude value (float)
                 - 'pred_lon': predicted longitude value (float)
                 - 'idx': dataset index (int)
+                - 'embedding': image embedding tensor (if available)
         """
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
@@ -241,7 +273,7 @@ class PredictionGeoDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         
-        return {
+        result = {
             'image': image,
             'true_lat': torch.tensor(float(row['true_lat'])),
             'true_lon': torch.tensor(float(row['true_lon'])),
@@ -249,6 +281,17 @@ class PredictionGeoDataset(Dataset):
             'pred_lon': torch.tensor(float(row['pred_lon'])),
             'idx': torch.tensor(idx)
         }
+        
+        # Add embedding if available
+        if self.has_embeddings and 'embedding' in row:
+            # Convert bytes back to numpy array
+            import numpy as np
+            embedding_bytes = row['embedding']
+            if isinstance(embedding_bytes, bytes):
+                embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                result['embedding'] = torch.tensor(embedding)
+        
+        return result
     
     def get_stats(self) -> dict:
         """
@@ -282,12 +325,17 @@ class PredictionGeoDataset(Dataset):
             all_pred_lats = all_pred_lats[:self.max_samples]
             all_pred_lons = all_pred_lons[:self.max_samples]
         
+        columns = ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon']
+        if self.has_embeddings:
+            columns.append('embedding')
+        
         return {
             'total_samples': self.total_samples,
             'parquet_path': str(self.parquet_path),
             'parquet_files': parquet_files,
             'num_shards': len(parquet_files),
-            'columns': ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'],
+            'columns': columns,
+            'has_embeddings': self.has_embeddings,
             'lat_range': (min(all_lats), max(all_lats)),
             'lon_range': (min(all_lons), max(all_lons)),
             'pred_lat_range': (min(all_pred_lats), max(all_pred_lats)),

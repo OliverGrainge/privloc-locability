@@ -25,6 +25,7 @@ import torch
 import numpy as np
 from data.datasets.predictiongeodataset import PredictionGeoDataset
 from torch.utils.data import DataLoader
+from torchvision import transforms
 import sys
 from utils import load_config_yaml
 from tqdm import tqdm
@@ -267,6 +268,8 @@ def compute_concept_similarities(dataset_path, concepts, original_concepts=None,
     
     # Load dataset
     print(f"\nLoading dataset from {dataset_path}...")
+    # Create a basic transform to convert PIL Images to tensors
+    # Since we're using pre-computed embeddings, we just need ToTensor()
     dataset = PredictionGeoDataset(dataset_path)
     
     # Check if embeddings are available
