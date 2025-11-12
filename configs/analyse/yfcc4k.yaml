@@ -1,0 +1,33 @@
+
+
+parameters:
+  dataset_path: "/iridisfs/geosets/oeg1n18/predictiondatasets/predictions/yfcc4k_geoclip"
+  concepts:
+    # Core environment types
+    - "urban city"
+    - "rural countryside"
+    - "coastline"
+    - "mountain landscape"
+    - "desert landscape"
+    - "snowy landscape"
+    - "tropical forest"
+
+    # Key natural cues
+    - "vegetation"
+    - "palm trees"
+    - "pine forest"
+    - "waterfront"
+    - "blue sky"
+
+    # Built-environment cues
+    - "road"
+    - "bridge"
+    - "skyscrapers"
+    - "residential houses"
+
+    # High-level architecture / cultural indicators
+    - "Gothic cathedral"
+    - "Islamic architecture"
+    - "Buddhist pagoda"
+    - "Japanese traditional architecture"
+    - "Mediterranean buildings"

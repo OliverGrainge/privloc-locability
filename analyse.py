@@ -446,11 +446,42 @@ def plot_correlation_bars(correlation_df, output_path):
     ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     ax1.grid(True, alpha=0.3)
     
+    # Get x-axis limits and find minimum correlation value for negative bars
+    xlim1 = ax1.get_xlim()
+    min_corr = df_sorted['pearson_r'].min()
+    max_corr = df_sorted['pearson_r'].max()
+    
+    # Extend left margin to accommodate negative correlation text labels
+    # Need space for text (approx 0.15 width) + padding
+    if min_corr < 0:
+        text_space = 0.15  # Space needed for text labels on left side
+        left_margin = min(xlim1[0], min_corr - text_space)
+    else:
+        left_margin = xlim1[0]
+    
+    # Also extend right margin if needed for positive correlation text
+    # Need more space since text is placed to the right of the bar
+    if max_corr > 0:
+        text_space_right = 0.12  # Space needed for text labels on right side (increased)
+        right_margin = max(xlim1[1], max_corr + text_space_right)
+    else:
+        right_margin = xlim1[1]
+    
+    ax1.set_xlim(left=left_margin, right=right_margin)
+    
     # Add correlation values
     for i, (bar, r) in enumerate(zip(bars1, df_sorted['pearson_r'])):
-        ax1.text(bar.get_width() + 0.01 if bar.get_width() > 0 else bar.get_width() - 0.01, 
+        if bar.get_width() > 0:
+            # Positive correlation: place text to the right of the bar
+            x_pos = bar.get_width() + 0.01
+            ha = 'left'
+        else:
+            # Negative correlation: place text just to the left of the bar end
+            x_pos = bar.get_width() - 0.02
+            ha = 'right'
+        ax1.text(x_pos, 
                 bar.get_y() + bar.get_height()/2, f'{r:.3f}', 
-                ha='left' if bar.get_width() > 0 else 'right', va='center', fontsize=10)
+                ha=ha, va='center', fontsize=10)
     
     # Plot Spearman correlations
     bars2 = ax2.barh(df_sorted['concept'], df_sorted['spearman_r'], color=colors, alpha=0.8)
@@ -459,11 +490,42 @@ def plot_correlation_bars(correlation_df, output_path):
     ax2.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     ax2.grid(True, alpha=0.3)
     
+    # Get x-axis limits and find minimum correlation value for negative bars
+    xlim2 = ax2.get_xlim()
+    min_corr = df_sorted['spearman_r'].min()
+    max_corr = df_sorted['spearman_r'].max()
+    
+    # Extend left margin to accommodate negative correlation text labels
+    # Need space for text (approx 0.15 width) + padding
+    if min_corr < 0:
+        text_space = 0.15  # Space needed for text labels on left side
+        left_margin = min(xlim2[0], min_corr - text_space)
+    else:
+        left_margin = xlim2[0]
+    
+    # Also extend right margin if needed for positive correlation text
+    # Need more space since text is placed to the right of the bar
+    if max_corr > 0:
+        text_space_right = 0.12  # Space needed for text labels on right side (increased)
+        right_margin = max(xlim2[1], max_corr + text_space_right)
+    else:
+        right_margin = xlim2[1]
+    
+    ax2.set_xlim(left=left_margin, right=right_margin)
+    
     # Add correlation values
     for i, (bar, r) in enumerate(zip(bars2, df_sorted['spearman_r'])):
-        ax2.text(bar.get_width() + 0.01 if bar.get_width() > 0 else bar.get_width() - 0.01, 
+        if bar.get_width() > 0:
+            # Positive correlation: place text to the right of the bar
+            x_pos = bar.get_width() + 0.01
+            ha = 'left'
+        else:
+            # Negative correlation: place text just to the left of the bar end
+            x_pos = bar.get_width() - 0.02
+            ha = 'right'
+        ax2.text(x_pos, 
                 bar.get_y() + bar.get_height()/2, f'{r:.3f}', 
-                ha='left' if bar.get_width() > 0 else 'right', va='center', fontsize=10)
+                ha=ha, va='center', fontsize=10)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
