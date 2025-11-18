@@ -87,7 +87,7 @@ def setup_logger(config: Dict[str, Any], config_name: str) -> WandbLogger:
         project="ConceptLocalizationPredictor",
         name=f"{config_name}_training",
         save_dir="logs/",
-        log_model=True
+        log_model=False
     )
     
     return logger
@@ -95,6 +95,52 @@ def setup_logger(config: Dict[str, Any], config_name: str) -> WandbLogger:
 
 
 
+
+import math
+import torch
+
+def estimate_positive_ratio(train_dataset, target_distance_km: float) -> float:
+    """
+    Estimate the fraction of positives (localizable within target distance)
+    on the *train* split, by scanning once.
+
+    We replicate the Haversine logic from the model.
+    """
+    R = 6371.0  # Earth radius in km
+
+    def haversine(lat1, lon1, lat2, lon2):
+        lat1 = torch.deg2rad(lat1)
+        lon1 = torch.deg2rad(lon1)
+        lat2 = torch.deg2rad(lat2)
+        lon2 = torch.deg2rad(lon2)
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = torch.sin(dlat / 2) ** 2 + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2
+        c = 2 * torch.arcsin(torch.sqrt(a))
+        return R * c
+
+    n_pos = 0
+    n_total = 0
+
+    # train_dataset is a Subset, so index into its .dataset
+    for idx in range(len(train_dataset)):
+        sample = train_dataset[idx]
+        true_lat = torch.tensor(sample["true_lat"], dtype=torch.float32)
+        true_lon = torch.tensor(sample["true_lon"], dtype=torch.float32)
+        pred_lat = torch.tensor(sample["pred_lat"], dtype=torch.float32)
+        pred_lon = torch.tensor(sample["pred_lon"], dtype=torch.float32)
+
+        dist = haversine(true_lat, true_lon, pred_lat, pred_lon)
+        label = (dist <= target_distance_km).item()  # 1 or 0
+
+        n_pos += int(label)
+        n_total += 1
+
+    if n_total == 0:
+        raise ValueError("Train dataset is empty when estimating positive ratio.")
+    return n_pos / n_total
+
+    
 def create_dataloaders(config: Dict[str, Any]) -> tuple:
     """
     Create train and validation dataloaders.
@@ -128,10 +174,19 @@ def create_dataloaders(config: Dict[str, Any]) -> tuple:
         [train_size, val_size],
         generator=torch.Generator().manual_seed(data_config.get('seed', 42))
     )
-    
+
     print(f"Train size: {len(train_dataset)}")
     print(f"Val size: {len(val_dataset)}")
-    
+
+    # >>> NEW: estimate positive ratio on train split
+    target_distance_km = config["model"].get("target_distance_km", 25.0)
+    pos_ratio = estimate_positive_ratio(train_dataset, target_distance_km)
+    neg_ratio = 1.0 - pos_ratio
+    pos_weight = neg_ratio / max(pos_ratio, 1e-6)  # avoid div by zero
+
+    print(f"Estimated train positive ratio: {pos_ratio:.4f}")
+    print(f"Using pos_weight = {pos_weight:.4f} for BCEWithLogitsLoss")
+
     # Create dataloaders
     train_dataloader = DataLoader(
         train_dataset,
@@ -148,36 +203,23 @@ def create_dataloaders(config: Dict[str, Any]) -> tuple:
         num_workers=num_workers,
         pin_memory=True
     )
-    
-    return train_dataloader, val_dataloader
+
+    return train_dataloader, val_dataloader, pos_weight
 
 
-def create_model(config: Dict[str, Any]) -> ConceptLocalizationPredictor:
-    """
-    Create the concept localization predictor from configuration.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        Initialized ConceptLocalizationPredictor
-    """
+def create_model(config: Dict[str, Any], pos_weight: float) -> ConceptLocalizationPredictor:
     model_config = config['model']
     concepts_config = config['concepts']
-    
-    # Extract class weights if provided
-    class_weights = model_config.get('class_weights', None)
-    
-    # Create model
+
     model = ConceptLocalizationPredictor(
         text_concepts=concepts_config['text_concepts'],
         target_distance_km=model_config.get('target_distance_km', 25.0),
         num_prompts_per_concept=model_config.get('num_prompts_per_concept', 12),
         learning_rate=model_config.get('learning_rate', 1e-3),
         weight_decay=model_config.get('weight_decay', 1e-4),
-        class_weights=class_weights
+        pos_weight=pos_weight,
+        decision_threshold=model_config.get('decision_threshold', 0.5),
     )
-    
     return model
 
 
@@ -254,11 +296,11 @@ def main():
     
     # Create dataloaders
     print("\nCreating dataloaders...")
-    train_dataloader, val_dataloader = create_dataloaders(config)
+    train_dataloader, val_dataloader, pos_weight = create_dataloaders(config)
     
     # Create model
     print("\nCreating model...")
-    model = create_model(config)
+    model = create_model(config, pos_weight)
     
     # Setup trainer
     print("\nSetting up trainer...")

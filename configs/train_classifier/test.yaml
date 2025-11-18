@@ -1,0 +1,21 @@
+model:
+  arch_name: "megaloc"
+  dataset_name: "yfcc4k"
+  pred_model_name: "geoclip"
+  threshold_km: 2500.0
+  learning_rate: 0.0001
+  batch_size: 32
+  num_workers: 8
+
+trainer:
+  max_epochs: 50
+  precision: 'bf16-mixed'
+  accelerator: 'auto'
+  devices: 'auto'
+  strategy: 'auto'
+  log_every_n_steps: 10
+  enable_progress_bar: true
+  check_val_every_n_epoch: 1
+
+checkpoint: true
+logger: true

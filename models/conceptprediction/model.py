@@ -106,7 +106,8 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         num_prompts_per_concept: int = 12,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
-        class_weights: list = None,
+        pos_weight: float = None,           # scalar ≈ n_neg / n_pos
+        decision_threshold: float = 0.2,    # see below
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -117,6 +118,9 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         self.num_prompts_per_concept = num_prompts_per_concept
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(weight_decay)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.decision_threshold = float(decision_threshold)
         
         # Load SigLip model for text encoding
         from transformers import AutoModel, AutoProcessor
@@ -136,27 +140,47 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         self.linear_probe = nn.Linear(self.num_concepts, 1)
         
         # Loss function with optional class weights
-        if class_weights is not None:
-            class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights_tensor[1])
+        if pos_weight is not None:
+            pw = torch.tensor(pos_weight, dtype=torch.float32)
+            # register as buffer so it moves with .to(device)
+            self.register_buffer("pos_weight", pw)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         else:
+            self.pos_weight = None
             self.criterion = nn.BCEWithLogitsLoss()
         
         # Metrics for train/val/test
-        self.train_accuracy = Accuracy(task='binary')
-        self.val_accuracy = Accuracy(task='binary')
-        
-        self.train_precision = Precision(task='binary')
-        self.val_precision = Precision(task='binary')
-        
-        self.train_recall = Recall(task='binary')
-        self.val_recall = Recall(task='binary')
-        
-        self.train_f1 = F1Score(task='binary')
-        self.val_f1 = F1Score(task='binary')
-        
+        self.train_accuracy = Accuracy(task='binary', threshold=self.decision_threshold)
+        self.val_accuracy   = Accuracy(task='binary', threshold=self.decision_threshold)
+
+        self.train_precision = Precision(task='binary', threshold=self.decision_threshold)
+        self.val_precision   = Precision(task='binary', threshold=self.decision_threshold)
+
+        self.train_recall = Recall(task='binary', threshold=self.decision_threshold)
+        self.val_recall   = Recall(task='binary', threshold=self.decision_threshold)
+
+        self.train_f1 = F1Score(task='binary', threshold=self.decision_threshold)
+        self.val_f1   = F1Score(task='binary', threshold=self.decision_threshold)
+
+        # AUROC remains threshold-free
         self.train_auroc = AUROC(task='binary')
-        self.val_auroc = AUROC(task='binary')
+        self.val_auroc   = AUROC(task='binary')
+        
+        # Separate metrics for random baseline
+        self.train_random_accuracy = Accuracy(task='binary')
+        self.val_random_accuracy = Accuracy(task='binary')
+        
+        self.train_random_precision = Precision(task='binary')
+        self.val_random_precision = Precision(task='binary')
+        
+        self.train_random_recall = Recall(task='binary')
+        self.val_random_recall = Recall(task='binary')
+        
+        self.train_random_f1 = F1Score(task='binary')
+        self.val_random_f1 = F1Score(task='binary')
+        
+        self.train_random_auroc = AUROC(task='binary')
+        self.val_random_auroc = AUROC(task='binary')
     
     def _compute_text_embeddings(self):
         """
@@ -288,30 +312,32 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         
         # Compute predictions
         probs = torch.sigmoid(logits)
-        preds = (probs >= 0.5).float()
+        preds = (probs >= self.decision_threshold).float()
         random_probs = torch.rand(probs.shape).float().to(probs.device)
         random_preds = (random_probs >= 0.5).float()
+
         
         # Log metrics
         metrics_dict = {
-            f'{stage}_loss': loss,
-            f'{stage}_accuracy': getattr(self, f'{stage}_accuracy')(preds, labels),
-            f'{stage}_precision': getattr(self, f'{stage}_precision')(preds, labels),
-            f'{stage}_recall': getattr(self, f'{stage}_recall')(preds, labels),
-            f'{stage}_f1': getattr(self, f'{stage}_f1')(preds, labels),
-            f'{stage}_auroc': getattr(self, f'{stage}_auroc')(probs, labels),
+            f'{stage}/loss': loss,
+            f'{stage}/accuracy': getattr(self, f'{stage}_accuracy')(preds, labels),
+            f'{stage}/precision': getattr(self, f'{stage}_precision')(preds, labels),
+            f'{stage}/recall': getattr(self, f'{stage}_recall')(preds, labels),
+            f'{stage}/f1': getattr(self, f'{stage}_f1')(preds, labels),
+            f'{stage}/auroc': getattr(self, f'{stage}_auroc')(probs, labels),
+            f'{stage}/prediction_ratio': preds.mean(),
 
-            f'{stage}_random_accuracy': getattr(self, f'{stage}_accuracy')(random_preds, labels),
-            f'{stage}_random_precision': getattr(self, f'{stage}_precision')(random_preds, labels),
-            f'{stage}_random_recall': getattr(self, f'{stage}_recall')(random_preds, labels),
-            f'{stage}_random_f1': getattr(self, f'{stage}_f1')(random_preds, labels),
-            f'{stage}_random_auroc': getattr(self, f'{stage}_auroc')(random_probs, labels),
+            f'{stage}/random_accuracy': getattr(self, f'{stage}_random_accuracy')(random_preds, labels),
+            f'{stage}/random_precision': getattr(self, f'{stage}_random_precision')(random_preds, labels),
+            f'{stage}/random_recall': getattr(self, f'{stage}_random_recall')(random_preds, labels),
+            f'{stage}/random_f1': getattr(self, f'{stage}_random_f1')(random_preds, labels),
+            f'{stage}/random_auroc': getattr(self, f'{stage}_random_auroc')(random_probs, labels),
 
         }
         
         # Log class distribution for imbalance monitoring
         pos_ratio = labels.mean()
-        metrics_dict[f'{stage}_positive_ratio'] = pos_ratio
+        metrics_dict[f'{stage}/positive_ratio'] = pos_ratio
         
         self.log_dict(metrics_dict, on_step=False, on_epoch=True, prog_bar=True)
         
