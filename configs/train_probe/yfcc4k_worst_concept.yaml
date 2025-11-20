@@ -18,8 +18,8 @@ concepts:
 model:
   target_distance_km: 25.0  # Distance threshold for binary classification
   num_prompts_per_concept: 12  # Number of prompt templates per concept for ensembling
-  learning_rate: 1e-4
-  weight_decay: 1e-4
+  learning_rate: 1e-3
+  weight_decay: 0.0
   # Optional: class weights for handling imbalance [weight_negative, weight_positive]
   # Uncomment and adjust based on your dataset's class distribution
   # class_weights: [1.0, 5.0]  # Example: weight positive class 5x more
@@ -28,7 +28,7 @@ model:
 trainer:
   accelerator: "gpu"
   devices: 1
-  max_epochs: 30
+  max_epochs: 80
   # Alternatively, use max_steps instead of max_epochs:
   # max_steps: 10000
   precision: "16-mixed"  # Use mixed precision for faster training
@@ -38,7 +38,7 @@ trainer:
   val_check_interval: 1.0  # Validate once per epoch
   check_val_every_n_epoch: 1
   deterministic: false
-  enable_progress_bar: false
+  enable_progress_bar: true
 
 # Checkpointing (set to true to save model checkpoints)
 checkpoint: False

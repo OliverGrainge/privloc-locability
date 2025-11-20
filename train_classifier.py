@@ -84,7 +84,7 @@ def setup_logger(config: Dict[str, Any], config_name: str) -> WandbLogger:
         project="GeoErrorBinaryClassifier",
         name=f"{config_name}_training",
         save_dir="logs/",
-        log_model=True
+        log_model=False
     )
     
     return logger
@@ -190,9 +190,12 @@ def main():
     print(f"Threshold: {config['model']['threshold_km']} km")
     print(f"Learning Rate: {config['model']['learning_rate']}")
     print(f"Batch Size: {config['model']['batch_size']}")
-    print(f"Max Epochs: {config['trainer'].get('max_epochs', 'N/A')}")
+    print(f"\nTraining Configuration:")
     print(f"Max Steps: {config['trainer'].get('max_steps', 'N/A')}")
-    
+    print(f"Max Epochs: {config['trainer'].get('max_epochs', 'N/A')}")
+    print(f"Validation Check Interval: {config['trainer'].get('val_check_interval', config['trainer'].get('check_val_every_n_epoch', 'N/A'))} {'steps' if 'val_check_interval' in config['trainer'] else 'epochs'}")
+    print(f"Max Validation Batches: {config['trainer'].get('limit_val_batches', 'All')}")
+    print(f"Max Test Batches: {config['trainer'].get('limit_test_batches', 'All')}")
     # Start training
     print("\nStarting training...")
     try:
@@ -203,12 +206,18 @@ def main():
         print("Training completed successfully!")
         
         # Print best model path if checkpointing was enabled
+        best_model_path = None
         if config.get('checkpoint', False):
             for callback in trainer.callbacks:
                 if isinstance(callback, ModelCheckpoint):
                     best_model_path = callback.best_model_path
                     print(f"Best model saved at: {best_model_path}")
                     break
+        
+        # Run test evaluation
+        print("\nRunning test evaluation...")
+        trainer.test(model, ckpt_path=best_model_path if best_model_path else None)
+        print("Test evaluation completed!")
             
     except Exception as e:
         print(f"Training failed with error: {e}")

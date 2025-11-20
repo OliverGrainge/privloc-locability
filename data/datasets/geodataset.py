@@ -25,7 +25,7 @@ class MP16Dataset(Dataset):
     def __init__(
         self,
         transform: Optional[Callable],
-        max_shards: Optional[int] = None
+        max_shards: Optional[int] = 5
     ):
         """
         Args:

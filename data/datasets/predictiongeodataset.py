@@ -29,18 +29,24 @@ class PredictionGeoDataset(Dataset):
         self,
         parquet_path: Union[str, Path],
         transform: Optional[Callable] = None,
-        max_samples: Optional[int] = None
+        max_shards: Optional[int] = None,
+        split: Optional[str] = None,
+        ratio: float = 0.9,
     ):
         """
         Args:
             parquet_path: Path to parquet file/directory containing prediction results.
                          Can be a single file or a directory containing sharded files (part_*.parquet)
             transform: Optional torchvision transform to apply to images
-            max_samples: Optional limit on number of samples to load (useful for debugging)
+            max_shards: Optional limit on number of shards to load (useful for debugging)
+            split: Optional split to use ('train' or 'val'). If None, uses all shards.
+            ratio: Ratio of shards to use for training (default 0.9 = 90% train, 10% val)
         """
         self.parquet_path = Path(parquet_path)
         self.transform = transform if transform is not None else self._default_transform()
-        self.max_samples = max_samples
+        self.max_shards = max_shards
+        self.split = split
+        self.ratio = ratio
         
         # Determine if we have a single file or sharded files
         if self.parquet_path.is_file():
@@ -53,6 +59,25 @@ class PredictionGeoDataset(Dataset):
                 raise FileNotFoundError(f"No parquet files found in directory: {self.parquet_path}")
         else:
             raise FileNotFoundError(f"Parquet path not found: {self.parquet_path}")
+
+        # Apply split logic if specified
+        if self.split is not None:
+            if self.split not in ['train', 'val']:
+                raise ValueError(f"Split must be 'train' or 'val', got '{self.split}'")
+            
+            total_shards = len(self.parquet_files)
+            train_shards = int(total_shards * self.ratio)
+            
+            if self.split == 'train':
+                self.parquet_files = self.parquet_files[:train_shards]
+                print(f"Using {len(self.parquet_files)} shards for training (ratio={self.ratio})")
+            else:  # val
+                self.parquet_files = self.parquet_files[train_shards:]
+                print(f"Using {len(self.parquet_files)} shards for validation (ratio={self.ratio})")
+        
+        # Apply max_shards limit if specified (after split)
+        if self.max_shards is not None:
+            self.parquet_files = self.parquet_files[:self.max_shards]
         
         # Initialize lazy loading state
         self.current_file_idx = None
@@ -77,10 +102,6 @@ class PredictionGeoDataset(Dataset):
             self.file_start_indices.append(self.total_samples)
             self.total_samples += file_rows
             print(f"File {i + 1}/{len(self.parquet_files)}: {file_path} ({file_rows} rows)")
-        
-        # Apply max_samples limit if specified
-        if self.max_samples is not None:
-            self.total_samples = min(self.total_samples, self.max_samples)
         
         print(f"Total samples across all files: {self.total_samples}")
         
@@ -173,10 +194,6 @@ class PredictionGeoDataset(Dataset):
         for i in range(len(self.current_df)):
             # Calculate global index
             global_idx = self.file_start_indices[file_idx] + i
-            
-            # Apply max_samples limit if specified
-            if self.max_samples is not None and global_idx >= self.max_samples:
-                break
                 
             row = self.current_df.iloc[i]
             
@@ -236,10 +253,6 @@ class PredictionGeoDataset(Dataset):
         """
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
-        
-        # Apply max_samples limit if specified
-        if self.max_samples is not None and idx >= self.max_samples:
-            raise IndexError(f"Index {idx} exceeds max_samples limit of {self.max_samples}")
         
         # Find which file contains this index
         file_idx = 0
@@ -317,13 +330,6 @@ class PredictionGeoDataset(Dataset):
             all_lons.extend(df['true_lon'].tolist())
             all_pred_lats.extend(df['pred_lat'].tolist())
             all_pred_lons.extend(df['pred_lon'].tolist())
-        
-        # Apply max_samples limit if specified
-        if self.max_samples is not None:
-            all_lats = all_lats[:self.max_samples]
-            all_lons = all_lons[:self.max_samples]
-            all_pred_lats = all_pred_lats[:self.max_samples]
-            all_pred_lons = all_pred_lons[:self.max_samples]
         
         columns = ['image_bytes', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon']
         if self.has_embeddings:

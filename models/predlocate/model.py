@@ -14,8 +14,13 @@ import pytorch_lightning as pl
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import logging
+import numpy as np
+from sklearn.metrics import precision_recall_curve, auc
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
 
 from .archs import load_arch_and_transform
 from data.datasets import load_prediction_dataset
@@ -89,6 +94,11 @@ class BinaryErrorClassifier(pl.LightningModule):
         self.train_neg_count = 0
         self.val_pos_count = 0
         self.val_neg_count = 0
+        
+        # For collecting test predictions for PR curve
+        self.test_predictions: List[torch.Tensor] = []
+        self.test_targets: List[torch.Tensor] = []
+
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -178,6 +188,23 @@ class BinaryErrorClassifier(pl.LightningModule):
         tn = ((preds == 0) & (targets == 0)).float().sum()
         fn = ((preds == 0) & (targets == 1)).float().sum()
         
+        # Random accuracy (expected accuracy of random classifier with no prior)
+        # For binary classification: 50% accuracy
+        random_accuracy = torch.tensor(0.5, device=targets.device)
+        
+        # Random baseline: generate random predictions (50% positive, 50% negative)
+        random_preds = (torch.rand(targets.shape, device=targets.device) > 0.5).float()
+        
+        # Random confusion matrix elements
+        random_tp = ((random_preds == 1) & (targets == 1)).float().sum()
+        random_fp = ((random_preds == 1) & (targets == 0)).float().sum()
+        random_fn = ((random_preds == 0) & (targets == 1)).float().sum()
+        
+        # Random precision, recall, F1
+        random_precision = random_tp / (random_tp + random_fp + 1e-8)
+        random_recall = random_tp / (random_tp + random_fn + 1e-8)
+        random_f1 = 2 * (random_precision * random_recall) / (random_precision + random_recall + 1e-8)
+        
         # Precision, recall, F1
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
@@ -185,9 +212,13 @@ class BinaryErrorClassifier(pl.LightningModule):
         
         return {
             'accuracy': accuracy,
+            'random_accuracy': random_accuracy,
             'precision': precision,
             'recall': recall,
             'f1': f1,
+            'random_precision': random_precision,
+            'random_recall': random_recall,
+            'random_f1': random_f1,
         }
     
     def _calculate_geodetic_error(self, lat1: torch.Tensor, lon1: torch.Tensor,
@@ -298,15 +329,14 @@ class BinaryErrorClassifier(pl.LightningModule):
             batch['true_lat'], batch['true_lon'],
             batch['pred_lat'], batch['pred_lon']
         )
-        
+
         # Create binary targets based on threshold
         targets = (error_km <= self.hparams.threshold_km).float()
         
         # Log class distribution and baselines (once per epoch)
-        if batch_idx == 0:
-            self._log_class_distribution(targets, 'train')
-            self._log_random_baseline(targets, 'train')
-        
+        self._log_class_distribution(targets, 'train')
+        self._log_random_baseline(targets, 'train')
+    
         # Compute class weights if needed (first batch)
         if self.pos_weight is None and self.use_weighted_loss:
             num_positive = (targets == 1).sum().item()
@@ -349,9 +379,8 @@ class BinaryErrorClassifier(pl.LightningModule):
         targets = (error_km <= self.hparams.threshold_km).float()
         
         # Log class distribution and baselines (once per epoch)
-        if batch_idx == 0:
-            self._log_class_distribution(targets, 'val')
-            self._log_random_baseline(targets, 'val')
+        self._log_class_distribution(targets, 'val')
+        self._log_random_baseline(targets, 'val')
         
         # Forward pass
         logits = self(images)
@@ -365,18 +394,103 @@ class BinaryErrorClassifier(pl.LightningModule):
         for key, value in metrics.items():
             self.log(f'val/{key}', value)
     
+    def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
+        """
+        Test step with collection of predictions for PR curve.
+        
+        Args:
+            batch: Batch with keys: 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
+            batch_idx: Batch index
+        """
+        images = batch['image']
+        
+        # Calculate geodetic error
+        error_km = self._calculate_geodetic_error(
+            batch['true_lat'], batch['true_lon'],
+            batch['pred_lat'], batch['pred_lon']
+        )
+        
+        # Create binary targets
+        targets = (error_km <= self.hparams.threshold_km).float()
+        
+        # Log class distribution and baselines
+        self._log_class_distribution(targets, 'test')
+        self._log_random_baseline(targets, 'test')
+        
+        # Forward pass
+        logits = self(images)
+        
+        # Compute loss and metrics
+        loss = self.compute_loss(logits, targets)
+        metrics = self.compute_metrics(logits, targets)
+        
+        # Log metrics
+        self.log('test/loss', loss, prog_bar=True)
+        for key, value in metrics.items():
+            self.log(f'test/{key}', value)
+        
+        # Store predictions and targets for PR curve
+        probs = torch.sigmoid(logits)
+        self.test_predictions.append(probs.detach().cpu())
+        self.test_targets.append(targets.detach().cpu())
+    
+    def on_test_epoch_end(self) -> None:
+        """
+        Compute and log PR curve and AUPRC at the end of test epoch.
+        """
+        if len(self.test_predictions) == 0:
+            logger.warning("No test predictions collected for PR curve")
+            return
+        
+        # Concatenate all predictions and targets
+        all_probs = torch.cat(self.test_predictions, dim=0).float().numpy()
+        all_targets = torch.cat(self.test_targets, dim=0).float().numpy()
+        
+        # Compute precision-recall curve
+        precision, recall, thresholds = precision_recall_curve(all_targets, all_probs)
+        
+        # Compute area under PR curve
+        auprc = auc(recall, precision)
+        
+        # Log AUPRC
+        self.log('test/auprc', auprc, prog_bar=True)
+        logger.info(f"Test AUPRC: {auprc:.4f}")
+        
+        # Create PR curve plot
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(recall, precision, linewidth=2, label=f'PR Curve (AUPRC = {auprc:.4f})')
+        ax.set_xlabel('Recall', fontsize=12)
+        ax.set_ylabel('Precision', fontsize=12)
+        ax.set_title('Precision-Recall Curve', fontsize=14)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        
+        # Log figure to WandB
+        plt.tight_layout()
+        if self.logger is not None and hasattr(self.logger, 'experiment'):
+            try:
+                import wandb
+                self.logger.experiment.log({
+                    "test/pr_curve": wandb.Image(fig)
+                })
+                logger.info("PR curve logged to WandB")
+            except Exception as e:
+                logger.warning(f"Failed to log PR curve to WandB: {e}")
+        else:
+            logger.warning("WandB logger not available, skipping PR curve logging")
+        
+        plt.close(fig)
+        
+        # Clear stored predictions and targets
+        self.test_predictions.clear()
+        self.test_targets.clear()
+    
     def configure_optimizers(self):
         """Configure optimizer with cosine annealing scheduler."""
         optimizer = Adam(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = CosineAnnealingLR(optimizer, T_max=10)
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'epoch'
-            }
-        }
+        return optimizer
     
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
@@ -384,12 +498,57 @@ class BinaryErrorClassifier(pl.LightningModule):
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
             transform=self.transform,
+            max_shards = 10,
+            split = "train",
+            ratio = 0.9,
         )
         
         return DataLoader(
             dataset,
             batch_size=self.hparams.batch_size,
-            shuffle=True,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+
+    def val_dataloader(self) -> DataLoader:
+        """Create training dataloader."""
+        dataset = load_prediction_dataset(
+            dataset_name=self.hparams.dataset_name,
+            model_name=self.hparams.pred_model_name,
+            transform=self.transform,
+            max_shards = 10,
+            split = "val",
+            ratio = 0.9,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+
+    def test_dataloader(self) -> DataLoader:
+        """Create training dataloader."""
+        dataset = load_prediction_dataset(
+            dataset_name=self.hparams.dataset_name,
+            model_name=self.hparams.pred_model_name,
+            transform=self.transform,
+            max_shards = 10,
+            split = "val",
+            ratio = 0.9,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=True,
