@@ -1,6 +1,6 @@
 model:
   arch_name: "megaloc"
-  dataset_name: "mp16"
+  dataset_name: "yfcc4k"
   pred_model_name: "geoclip"
   threshold_km: 1000.0
   learning_rate: 0.0001

@@ -99,13 +99,8 @@ class ConceptLocalizationPredictor(pl.LightningModule):
     Linear probe that predicts whether an image can be localized within 
     a target distance based on concept similarity scores computed on-the-fly.
     
-    Args:
-        text_concepts: List of text concept strings (e.g., ["vegetation", "building", "water"])
-        target_distance_km: Distance threshold in kilometers for binary classification
-        num_prompts_per_concept: Number of prompt templates per concept for ensembling
-        learning_rate: Learning rate for optimizer
-        weight_decay: Weight decay for regularization
-        class_weights: Optional weights for handling class imbalance [weight_neg, weight_pos]
+    This model is designed to be comparable with BinaryErrorClassifier and uses
+    the same configuration structure for training and evaluation.
     """
     
     def __init__(
@@ -113,27 +108,37 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         text_concepts: list,
         dataset_name: str,
         pred_model_name: str,
-        target_distance_km: float = 25.0,
-        num_prompts_per_concept: int = 12,
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-4,
-        pos_weight: float = None,           # scalar ≈ n_neg / n_pos
-        decision_threshold: float = 0.2,    # see below
+        threshold_km: float = 1000.0,
+        learning_rate: float = 1e-4,
         batch_size: int = 32,
         num_workers: int = 8,
+        weight_decay: float = 1e-4,
+        num_prompts_per_concept: int = 12,
+        decision_threshold: float = 0.5,
+        use_weighted_loss: bool = True,
     ):
+        """
+        Initialize the concept localization predictor.
+        
+        Args:
+            text_concepts: List of text concept strings
+            dataset_name: Name of the dataset to load
+            pred_model_name: Name of the prediction model
+            threshold_km: Distance threshold in kilometers (default: 1000)
+            learning_rate: Learning rate for optimizer
+            batch_size: Batch size for training
+            num_workers: Number of workers for data loading
+            weight_decay: Weight decay for regularization
+            num_prompts_per_concept: Number of prompt templates per concept
+            decision_threshold: Decision threshold for binary classification
+            use_weighted_loss: Whether to use weighted loss based on class distribution
+        """
         super().__init__()
         self.save_hyperparameters()
+        self.decision_threshold = decision_threshold
         
         self.text_concepts = text_concepts
         self.num_concepts = len(text_concepts)
-        self.target_distance_km = float(target_distance_km)
-        self.num_prompts_per_concept = num_prompts_per_concept
-        self.learning_rate = float(learning_rate)
-        self.weight_decay = float(weight_decay)
-        self.learning_rate = float(learning_rate)
-        self.weight_decay = float(weight_decay)
-        self.decision_threshold = float(decision_threshold)
         
         # Load SigLip model for text encoding
         from transformers import AutoModel, AutoProcessor
@@ -152,15 +157,10 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         # Linear probe: concept similarities -> binary classification
         self.linear_probe = nn.Linear(self.num_concepts, 1)
         
-        # Loss function with optional class weights
-        if pos_weight is not None:
-            pw = torch.tensor(pos_weight, dtype=torch.float32)
-            # register as buffer so it moves with .to(device)
-            self.register_buffer("pos_weight", pw)
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-        else:
-            self.pos_weight = None
-            self.criterion = nn.BCEWithLogitsLoss()
+        # Loss function configuration
+        self.use_weighted_loss = use_weighted_loss
+        self.pos_weight = None
+        self.criterion = nn.BCEWithLogitsLoss(reduction='none')
         
         # Metrics for train/val/test
         self.train_accuracy = Accuracy(task='binary', threshold=self.decision_threshold)
@@ -224,7 +224,7 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         # Generate ensemble prompts for each concept
         ensemble_prompts = enhance_concept_prompts_ensemble(
             self.text_concepts, 
-            num_prompts=self.num_prompts_per_concept
+            num_prompts=self.hparams.num_prompts_per_concept
         )
         
         # Process all ensemble prompts
@@ -244,7 +244,7 @@ class ConceptLocalizationPredictor(pl.LightningModule):
             # Reshape to [num_concepts, num_prompts_per_concept, embed_dim]
             text_embeds_norm = text_embeds_norm.view(
                 len(self.text_concepts), 
-                self.num_prompts_per_concept, 
+                self.hparams.num_prompts_per_concept, 
                 -1
             )
             
@@ -312,7 +312,7 @@ class ConceptLocalizationPredictor(pl.LightningModule):
             return 6371.0 * c  # Earth radius in km
         
         errors = haversine_distance(true_lat, true_lon, pred_lat, pred_lon)
-        labels = (errors <= self.target_distance_km).float()
+        labels = (errors <= self.hparams.threshold_km).float()
         return labels, errors
     
     def shared_step(self, batch, batch_idx, stage='train'):
@@ -335,15 +335,32 @@ class ConceptLocalizationPredictor(pl.LightningModule):
             true_lat, true_lon, pred_lat, pred_lon
         )
         
+        # Compute class weights if needed (first training batch)
+        if stage == 'train' and self.pos_weight is None and self.use_weighted_loss:
+            num_positive = (labels == 1).sum().item()
+            num_negative = (labels == 0).sum().item()
+            if num_positive > 0:
+                self.pos_weight = num_negative / num_positive
+                logger.info(f"Computed pos_weight: {self.pos_weight:.4f}")
+        
         # Forward pass (computes similarities internally)
         logits = self(image_embeds)
         
-        # Compute loss
-        loss = self.criterion(logits, labels)
+        # Compute loss with optional weighting
+        if self.pos_weight is not None:
+            bce_losses = self.criterion(logits, labels)
+            weights = torch.where(
+                labels == 1,
+                torch.full_like(labels, self.pos_weight),
+                torch.ones_like(labels)
+            )
+            loss = (bce_losses * weights).mean()
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, labels)
         
         # Compute predictions
         probs = torch.sigmoid(logits)
-        preds = (probs >= self.decision_threshold).float()
+        preds = (probs >= self.hparams.decision_threshold).float()
         random_probs = torch.rand(probs.shape).float().to(probs.device)
         random_preds = (random_probs >= 0.5).float()
 
@@ -398,12 +415,21 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         # Forward pass (computes similarities internally)
         logits = self(image_embeds)
         
-        # Compute loss
-        loss = self.criterion(logits, labels)
+        # Compute loss with optional weighting
+        if self.pos_weight is not None:
+            bce_losses = self.criterion(logits, labels)
+            weights = torch.where(
+                labels == 1,
+                torch.full_like(labels, self.pos_weight),
+                torch.ones_like(labels)
+            )
+            loss = (bce_losses * weights).mean()
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, labels)
         
         # Compute predictions
         probs = torch.sigmoid(logits)
-        preds = (probs >= self.decision_threshold).float()
+        preds = (probs >= self.hparams.decision_threshold).float()
         random_probs = torch.rand(probs.shape).float().to(probs.device)
         random_preds = (random_probs >= 0.5).float()
         
@@ -526,12 +552,12 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         self.test_random_predictions.clear()
     
     def configure_optimizers(self):
+        """Configure optimizer."""
         optimizer = AdamW(
             self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
         )
-        
         return optimizer
     
     def train_dataloader(self) -> DataLoader:
@@ -553,7 +579,8 @@ class ConceptLocalizationPredictor(pl.LightningModule):
             pin_memory=True,
             drop_last=True,
         )
-    
+
+
     def val_dataloader(self) -> DataLoader:
         """Create validation dataloader."""
         dataset = load_prediction_dataset(
@@ -573,7 +600,8 @@ class ConceptLocalizationPredictor(pl.LightningModule):
             pin_memory=True,
             drop_last=True,
         )
-    
+
+
     def test_dataloader(self) -> DataLoader:
         """Create test dataloader."""
         dataset = load_prediction_dataset(
