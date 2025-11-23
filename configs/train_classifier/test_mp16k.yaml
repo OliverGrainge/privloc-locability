@@ -8,17 +8,16 @@ model:
   num_workers: 0
 
 trainer:
-  max_steps: 1  # Maximum number of training steps (-1 for no limit)
+  max_steps: 5000  # Maximum number of training steps (-1 for no limit)
   max_epochs: -1  # Use -1 to disable epoch-based training when using steps
   precision: 'bf16-mixed'
   accelerator: 'auto'
   devices: 'auto'
   strategy: 'auto'
-  log_every_n_steps: 100
+  log_every_n_steps: 1
   enable_progress_bar: true
-  val_check_interval: 1  # Run validation every N training steps
+  val_check_interval: 1000  # Run validation every N training steps
   limit_val_batches: 100  # Maximum number of validation batches per validation run (int or float for fraction)
-  limit_test_batches: 100
 
 checkpoint: False
 logger: true

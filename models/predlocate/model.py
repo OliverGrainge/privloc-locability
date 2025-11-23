@@ -98,6 +98,7 @@ class BinaryErrorClassifier(pl.LightningModule):
         # For collecting test predictions for PR curve
         self.test_predictions: List[torch.Tensor] = []
         self.test_targets: List[torch.Tensor] = []
+        self.test_random_predictions: List[torch.Tensor] = []
 
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,12 +189,11 @@ class BinaryErrorClassifier(pl.LightningModule):
         tn = ((preds == 0) & (targets == 0)).float().sum()
         fn = ((preds == 0) & (targets == 1)).float().sum()
         
-        # Random accuracy (expected accuracy of random classifier with no prior)
-        # For binary classification: 50% accuracy
-        random_accuracy = torch.tensor(0.5, device=targets.device)
-        
         # Random baseline: generate random predictions (50% positive, 50% negative)
         random_preds = (torch.rand(targets.shape, device=targets.device) > 0.5).float()
+        
+        # Random accuracy computed from random predictions
+        random_accuracy = (random_preds == targets).float().mean()
         
         # Random confusion matrix elements
         random_tp = ((random_preds == 1) & (targets == 1)).float().sum()
@@ -279,37 +279,6 @@ class BinaryErrorClassifier(pl.LightningModule):
             self.val_pos_count += num_positive
             self.val_neg_count += num_negative
     
-    def _log_random_baseline(self, targets: torch.Tensor, stage: str) -> None:
-        """
-        Log random baseline accuracy for comparison.
-        
-        Random baseline is the accuracy achieved by always predicting the majority class.
-        
-        Args:
-            targets: Binary targets
-            stage: 'train' or 'val'
-        """
-        num_positive = (targets == 1).sum().item()
-        num_negative = (targets == 0).sum().item()
-        total = len(targets)
-        
-        if total == 0:
-            return
-        
-        # Random baseline: always predict majority class
-        random_baseline = max(num_positive, num_negative) / total
-        
-        # Balanced random baseline: 50% accuracy (random guessing)
-        balanced_baseline = 0.5
-        
-        logger.info(
-            f"{stage.upper()} Baselines - "
-            f"Majority Class Baseline: {100.0 * random_baseline:.2f}%, "
-            f"Balanced Random Baseline: {100.0 * balanced_baseline:.2f}%"
-        )
-        
-        self.log(f'{stage}/random_baseline_majority', random_baseline)
-        self.log(f'{stage}/random_baseline_balanced', balanced_baseline)
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
@@ -335,7 +304,6 @@ class BinaryErrorClassifier(pl.LightningModule):
         
         # Log class distribution and baselines (once per epoch)
         self._log_class_distribution(targets, 'train')
-        self._log_random_baseline(targets, 'train')
     
         # Compute class weights if needed (first batch)
         if self.pos_weight is None and self.use_weighted_loss:
@@ -380,7 +348,6 @@ class BinaryErrorClassifier(pl.LightningModule):
         
         # Log class distribution and baselines (once per epoch)
         self._log_class_distribution(targets, 'val')
-        self._log_random_baseline(targets, 'val')
         
         # Forward pass
         logits = self(images)
@@ -415,7 +382,6 @@ class BinaryErrorClassifier(pl.LightningModule):
         
         # Log class distribution and baselines
         self._log_class_distribution(targets, 'test')
-        self._log_random_baseline(targets, 'test')
         
         # Forward pass
         logits = self(images)
@@ -433,6 +399,10 @@ class BinaryErrorClassifier(pl.LightningModule):
         probs = torch.sigmoid(logits)
         self.test_predictions.append(probs.detach().cpu())
         self.test_targets.append(targets.detach().cpu())
+        
+        # Store random predictions for baseline PR curve
+        random_probs = torch.rand(targets.shape, device=targets.device)
+        self.test_random_predictions.append(random_probs.detach().cpu())
     
     def on_test_epoch_end(self) -> None:
         """
@@ -445,20 +415,26 @@ class BinaryErrorClassifier(pl.LightningModule):
         # Concatenate all predictions and targets
         all_probs = torch.cat(self.test_predictions, dim=0).float().numpy()
         all_targets = torch.cat(self.test_targets, dim=0).float().numpy()
+        all_random_probs = torch.cat(self.test_random_predictions, dim=0).float().numpy()
         
-        # Compute precision-recall curve
+        # Compute precision-recall curve for model predictions
         precision, recall, thresholds = precision_recall_curve(all_targets, all_probs)
-        
-        # Compute area under PR curve
         auprc = auc(recall, precision)
         
-        # Log AUPRC
-        self.log('test/auprc', auprc, prog_bar=True)
-        logger.info(f"Test AUPRC: {auprc:.4f}")
+        # Compute precision-recall curve for random predictions
+        random_precision, random_recall, random_thresholds = precision_recall_curve(all_targets, all_random_probs)
+        random_auprc = auc(random_recall, random_precision)
         
-        # Create PR curve plot
+        # Log AUPRCs
+        self.log('test/auprc', auprc, prog_bar=True)
+        self.log('test/random_auprc', random_auprc, prog_bar=True)
+        logger.info(f"Test AUPRC: {auprc:.4f}, Random AUPRC: {random_auprc:.4f}")
+        
+        # Create combined PR curve plot (model + random baseline)
         fig, ax = plt.subplots(figsize=(8, 6))
-        ax.plot(recall, precision, linewidth=2, label=f'PR Curve (AUPRC = {auprc:.4f})')
+        ax.plot(recall, precision, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
+        ax.plot(random_recall, random_precision, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
+                color='red', linestyle='--', alpha=0.7)
         ax.set_xlabel('Recall', fontsize=12)
         ax.set_ylabel('Precision', fontsize=12)
         ax.set_title('Precision-Recall Curve', fontsize=14)
@@ -467,7 +443,7 @@ class BinaryErrorClassifier(pl.LightningModule):
         ax.set_xlim([0.0, 1.0])
         ax.set_ylim([0.0, 1.05])
         
-        # Log figure to WandB
+        # Log PR curve figure to WandB
         plt.tight_layout()
         if self.logger is not None and hasattr(self.logger, 'experiment'):
             try:
@@ -483,9 +459,40 @@ class BinaryErrorClassifier(pl.LightningModule):
         
         plt.close(fig)
         
+        # Create combined RP curve plot (model + random baseline, swapped axes)
+        # Note: The area under the curve is the same as AUPRC (just with axes swapped for visualization)
+        fig_rp, ax_rp = plt.subplots(figsize=(8, 6))
+        ax_rp.plot(precision, recall, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
+        ax_rp.plot(random_precision, random_recall, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
+                   color='red', linestyle='--', alpha=0.7)
+        ax_rp.set_xlabel('Precision', fontsize=12)
+        ax_rp.set_ylabel('Recall', fontsize=12)
+        ax_rp.set_title('Recall-Precision Curve', fontsize=14)
+        ax_rp.legend(loc='best', fontsize=10)
+        ax_rp.grid(True, alpha=0.3)
+        ax_rp.set_xlim([0.0, 1.0])
+        ax_rp.set_ylim([0.0, 1.05])
+        
+        # Log RP curve figure to WandB
+        plt.tight_layout()
+        if self.logger is not None and hasattr(self.logger, 'experiment'):
+            try:
+                import wandb
+                self.logger.experiment.log({
+                    "test/rp_curve": wandb.Image(fig_rp)
+                })
+                logger.info("RP curve logged to WandB")
+            except Exception as e:
+                logger.warning(f"Failed to log RP curve to WandB: {e}")
+        else:
+            logger.warning("WandB logger not available, skipping RP curve logging")
+        
+        plt.close(fig_rp)
+        
         # Clear stored predictions and targets
         self.test_predictions.clear()
         self.test_targets.clear()
+        self.test_random_predictions.clear()
     
     def configure_optimizers(self):
         """Configure optimizer with cosine annealing scheduler."""

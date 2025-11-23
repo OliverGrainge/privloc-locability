@@ -17,8 +17,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import Adam, AdamW
+from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, Precision, Recall, F1Score, AUROC
+from sklearn.metrics import precision_recall_curve, auc
+import matplotlib.pyplot as plt
 import numpy as np
+import logging
+from typing import List
+
+from data.datasets import load_prediction_dataset
+
+logger = logging.getLogger(__name__)
 
 
 def enhance_concept_prompts_ensemble(concepts, num_prompts=12):
@@ -102,12 +111,16 @@ class ConceptLocalizationPredictor(pl.LightningModule):
     def __init__(
         self,
         text_concepts: list,
+        dataset_name: str,
+        pred_model_name: str,
         target_distance_km: float = 25.0,
         num_prompts_per_concept: int = 12,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         pos_weight: float = None,           # scalar ≈ n_neg / n_pos
         decision_threshold: float = 0.2,    # see below
+        batch_size: int = 32,
+        num_workers: int = 8,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -181,6 +194,24 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         
         self.train_random_auroc = AUROC(task='binary')
         self.val_random_auroc = AUROC(task='binary')
+        
+        # Test metrics
+        self.test_accuracy = Accuracy(task='binary', threshold=self.decision_threshold)
+        self.test_precision = Precision(task='binary', threshold=self.decision_threshold)
+        self.test_recall = Recall(task='binary', threshold=self.decision_threshold)
+        self.test_f1 = F1Score(task='binary', threshold=self.decision_threshold)
+        self.test_auroc = AUROC(task='binary')
+        
+        self.test_random_accuracy = Accuracy(task='binary')
+        self.test_random_precision = Precision(task='binary')
+        self.test_random_recall = Recall(task='binary')
+        self.test_random_f1 = F1Score(task='binary')
+        self.test_random_auroc = AUROC(task='binary')
+        
+        # For collecting test predictions for PR curve
+        self.test_predictions: List[torch.Tensor] = []
+        self.test_targets: List[torch.Tensor] = []
+        self.test_random_predictions: List[torch.Tensor] = []
     
     def _compute_text_embeddings(self):
         """
@@ -349,6 +380,151 @@ class ConceptLocalizationPredictor(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         return self.shared_step(batch, batch_idx, stage='val')
     
+    def test_step(self, batch, batch_idx):
+        """
+        Test step with collection of predictions for PR curve.
+        """
+        image_embeds = batch['embedding']
+        true_lat = batch['true_lat']
+        true_lon = batch['true_lon']
+        pred_lat = batch['pred_lat']
+        pred_lon = batch['pred_lon']
+        
+        # Compute binary labels
+        labels, errors = self.compute_localization_labels(
+            true_lat, true_lon, pred_lat, pred_lon
+        )
+        
+        # Forward pass (computes similarities internally)
+        logits = self(image_embeds)
+        
+        # Compute loss
+        loss = self.criterion(logits, labels)
+        
+        # Compute predictions
+        probs = torch.sigmoid(logits)
+        preds = (probs >= self.decision_threshold).float()
+        random_probs = torch.rand(probs.shape).float().to(probs.device)
+        random_preds = (random_probs >= 0.5).float()
+        
+        # Log metrics
+        metrics_dict = {
+            'test/loss': loss,
+            'test/accuracy': self.test_accuracy(preds, labels),
+            'test/precision': self.test_precision(preds, labels),
+            'test/recall': self.test_recall(preds, labels),
+            'test/f1': self.test_f1(preds, labels),
+            'test/auroc': self.test_auroc(probs, labels),
+            'test/prediction_ratio': preds.mean(),
+            'test/random_accuracy': self.test_random_accuracy(random_preds, labels),
+            'test/random_precision': self.test_random_precision(random_preds, labels),
+            'test/random_recall': self.test_random_recall(random_preds, labels),
+            'test/random_f1': self.test_random_f1(random_preds, labels),
+            'test/random_auroc': self.test_random_auroc(random_probs, labels),
+        }
+        
+        # Log class distribution for imbalance monitoring
+        pos_ratio = labels.mean()
+        metrics_dict['test/positive_ratio'] = pos_ratio
+        
+        self.log_dict(metrics_dict, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # Store predictions and targets for PR curve
+        self.test_predictions.append(probs.detach().cpu())
+        self.test_targets.append(labels.detach().cpu())
+        self.test_random_predictions.append(random_probs.detach().cpu())
+        
+        return loss
+    
+    def on_test_epoch_end(self) -> None:
+        """
+        Compute and log PR curve and AUPRC at the end of test epoch.
+        """
+        if len(self.test_predictions) == 0:
+            logger.warning("No test predictions collected for PR curve")
+            return
+        
+        # Concatenate all predictions and targets
+        all_probs = torch.cat(self.test_predictions, dim=0).float().numpy()
+        all_targets = torch.cat(self.test_targets, dim=0).float().numpy()
+        all_random_probs = torch.cat(self.test_random_predictions, dim=0).float().numpy()
+        
+        # Compute precision-recall curve for model predictions
+        precision, recall, thresholds = precision_recall_curve(all_targets, all_probs)
+        auprc = auc(recall, precision)
+        
+        # Compute precision-recall curve for random predictions
+        random_precision, random_recall, random_thresholds = precision_recall_curve(all_targets, all_random_probs)
+        random_auprc = auc(random_recall, random_precision)
+        
+        # Log AUPRCs
+        self.log('test/auprc', auprc, prog_bar=True)
+        self.log('test/random_auprc', random_auprc, prog_bar=True)
+        logger.info(f"Test AUPRC: {auprc:.4f}, Random AUPRC: {random_auprc:.4f}")
+        
+        # Create combined PR curve plot (model + random baseline)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(recall, precision, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
+        ax.plot(random_recall, random_precision, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
+                color='red', linestyle='--', alpha=0.7)
+        ax.set_xlabel('Recall', fontsize=12)
+        ax.set_ylabel('Precision', fontsize=12)
+        ax.set_title('Precision-Recall Curve', fontsize=14)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        
+        # Log PR curve figure to WandB
+        plt.tight_layout()
+        if self.logger is not None and hasattr(self.logger, 'experiment'):
+            try:
+                import wandb
+                self.logger.experiment.log({
+                    "test/pr_curve": wandb.Image(fig)
+                })
+                logger.info("PR curve logged to WandB")
+            except Exception as e:
+                logger.warning(f"Failed to log PR curve to WandB: {e}")
+        else:
+            logger.warning("WandB logger not available, skipping PR curve logging")
+        
+        plt.close(fig)
+        
+        # Create combined RP curve plot (model + random baseline, swapped axes)
+        fig_rp, ax_rp = plt.subplots(figsize=(8, 6))
+        ax_rp.plot(precision, recall, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
+        ax_rp.plot(random_precision, random_recall, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
+                   color='red', linestyle='--', alpha=0.7)
+        ax_rp.set_xlabel('Precision', fontsize=12)
+        ax_rp.set_ylabel('Recall', fontsize=12)
+        ax_rp.set_title('Recall-Precision Curve', fontsize=14)
+        ax_rp.legend(loc='best', fontsize=10)
+        ax_rp.grid(True, alpha=0.3)
+        ax_rp.set_xlim([0.0, 1.0])
+        ax_rp.set_ylim([0.0, 1.05])
+        
+        # Log RP curve figure to WandB
+        plt.tight_layout()
+        if self.logger is not None and hasattr(self.logger, 'experiment'):
+            try:
+                import wandb
+                self.logger.experiment.log({
+                    "test/rp_curve": wandb.Image(fig_rp)
+                })
+                logger.info("RP curve logged to WandB")
+            except Exception as e:
+                logger.warning(f"Failed to log RP curve to WandB: {e}")
+        else:
+            logger.warning("WandB logger not available, skipping RP curve logging")
+        
+        plt.close(fig_rp)
+        
+        # Clear stored predictions and targets
+        self.test_predictions.clear()
+        self.test_targets.clear()
+        self.test_random_predictions.clear()
+    
     def configure_optimizers(self):
         optimizer = AdamW(
             self.parameters(),
@@ -357,3 +533,63 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         )
         
         return optimizer
+    
+    def train_dataloader(self) -> DataLoader:
+        """Create training dataloader."""
+        dataset = load_prediction_dataset(
+            dataset_name=self.hparams.dataset_name,
+            model_name=self.hparams.pred_model_name,
+            transform=None,  # No transform needed for embeddings
+            max_shards=10,
+            split="train",
+            ratio=0.9,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+    
+    def val_dataloader(self) -> DataLoader:
+        """Create validation dataloader."""
+        dataset = load_prediction_dataset(
+            dataset_name=self.hparams.dataset_name,
+            model_name=self.hparams.pred_model_name,
+            transform=None,  # No transform needed for embeddings
+            max_shards=10,
+            split="val",
+            ratio=0.9,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+    
+    def test_dataloader(self) -> DataLoader:
+        """Create test dataloader."""
+        dataset = load_prediction_dataset(
+            dataset_name=self.hparams.dataset_name,
+            model_name=self.hparams.pred_model_name,
+            transform=None,  # No transform needed for embeddings
+            max_shards=10,
+            split="val",
+            ratio=0.9,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
