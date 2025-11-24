@@ -29,7 +29,7 @@ from data.datasets import load_prediction_dataset
 logger = logging.getLogger(__name__)
 
 
-class BinaryErrorClassifier(pl.LightningModule):
+class BinaryClassifier(pl.LightningModule):
     """
     Binary classifier for geolocation error prediction with class imbalance handling.
     
@@ -590,9 +590,7 @@ class BinaryErrorClassifier(pl.LightningModule):
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
             transform=self.transform,
-            max_shards = 10,
-            split = "train",
-            ratio = 0.9,
+            split="train",
         )
         
         # Only drop last if dataset is large enough to have at least one full batch
@@ -614,9 +612,7 @@ class BinaryErrorClassifier(pl.LightningModule):
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
             transform=self.transform,
-            max_shards = 10,
-            split = "val",
-            ratio = 0.9,
+            split="val",
         )
         
         # Only drop last if dataset is large enough to have at least one full batch
@@ -634,13 +630,14 @@ class BinaryErrorClassifier(pl.LightningModule):
 
     def test_dataloader(self) -> DataLoader:
         """Create test dataloader."""
+        # For mp16, use "val" split for testing
+        # For yfcc4k and im2gps3k, these are test-only datasets, so no split needed
+        split = "val" if self.hparams.dataset_name == "mp16" else None
         dataset = load_prediction_dataset(
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
             transform=self.transform,
-            max_shards = 10,
-            split = "val",
-            ratio = 0.9,
+            split=split,
         )
         
         # Only drop last if dataset is large enough to have at least one full batch

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training script for BinaryErrorClassifier.
+Training script for BinaryClassifier.
 
 This script loads a configuration file and trains the binary error classification model
 with checkpointing and logging capabilities.
@@ -18,7 +18,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 
-from models.predlocate import BinaryErrorClassifier
+from models.predlocate import BinaryClassifier
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -91,7 +91,7 @@ def setup_logger(config: Dict[str, Any], config_name: str) -> WandbLogger:
 
 
 
-def create_model(config: Dict[str, Any]) -> BinaryErrorClassifier:
+def create_model(config: Dict[str, Any]) -> BinaryClassifier:
     """
     Create the binary error classifier from configuration.
     
@@ -99,10 +99,10 @@ def create_model(config: Dict[str, Any]) -> BinaryErrorClassifier:
         config: Configuration dictionary
         
     Returns:
-        Initialized BinaryErrorClassifier
+        Initialized BinaryClassifier
     """
     model_config = config['model']
-    model = BinaryErrorClassifier(**model_config)
+    model = BinaryClassifier(**model_config)
     return model
 
 
@@ -148,7 +148,7 @@ def main():
     """
     Main training function.
     """
-    parser = argparse.ArgumentParser(description='Train BinaryErrorClassifier')
+    parser = argparse.ArgumentParser(description='Train BinaryClassifier')
     parser.add_argument(
         '--config', 
         type=str, 
