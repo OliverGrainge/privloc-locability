@@ -18,6 +18,7 @@ NTASKS=1
 GPUS=2
 CPUS=12
 TIME="1:00:00"
+
 PARTITION="quad_h200"
 
 # Generate job name from script name with timestamp and optional config info
