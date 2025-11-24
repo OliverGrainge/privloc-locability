@@ -15,10 +15,10 @@ ARGS="$@"
 # Set your default resources here (based on your typical setup)
 NODES=1
 NTASKS=1
-GPUS=2
+GPUS=1
 CPUS=12
-TIME="1:00:00"
-PARTITION="quad_h200"
+TIME="12:00:00"
+PARTITION="swarm_h100"
 
 # Generate job name from script name with timestamp and optional config info
 BASE_NAME=$(basename "$PYTHON_SCRIPT" .py)
