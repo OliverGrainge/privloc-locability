@@ -43,7 +43,9 @@ class PredictionGeoDataset(Dataset):
             ratio: Ratio of shards to use for training (default 0.9 = 90% train, 10% val)
         """
         self.parquet_path = Path(parquet_path)
-        self.transform = transform if transform is not None else self._default_transform()
+        # If transform is None, don't apply any transform (return PIL images)
+        # If transform is provided, use it
+        self.transform = transform
         self.max_shards = max_shards
         self.split = split
         self.ratio = ratio
@@ -60,24 +62,46 @@ class PredictionGeoDataset(Dataset):
         else:
             raise FileNotFoundError(f"Parquet path not found: {self.parquet_path}")
 
+        # Apply max_shards limit if specified (before split)
+        if self.max_shards is not None:
+            self.parquet_files = self.parquet_files[:self.max_shards]
+        
         # Apply split logic if specified
+        # If there's only 1 shard, partition the data within that shard
+        self.split_start_idx = None
+        self.split_end_idx = None
+        
         if self.split is not None:
             if self.split not in ['train', 'val']:
                 raise ValueError(f"Split must be 'train' or 'val', got '{self.split}'")
             
             total_shards = len(self.parquet_files)
-            train_shards = int(total_shards * self.ratio)
             
-            if self.split == 'train':
-                self.parquet_files = self.parquet_files[:train_shards]
-                print(f"Using {len(self.parquet_files)} shards for training (ratio={self.ratio})")
-            else:  # val
-                self.parquet_files = self.parquet_files[train_shards:]
-                print(f"Using {len(self.parquet_files)} shards for validation (ratio={self.ratio})")
-        
-        # Apply max_shards limit if specified (after split)
-        if self.max_shards is not None:
-            self.parquet_files = self.parquet_files[:self.max_shards]
+            # If only 1 shard, partition data within the shard
+            if total_shards == 1:
+                # First, get the total number of rows in the single shard
+                df_meta = pd.read_parquet(self.parquet_files[0], engine='pyarrow')
+                total_rows = len(df_meta)
+                train_rows = int(total_rows * self.ratio)
+                
+                if self.split == 'train':
+                    self.split_start_idx = 0
+                    self.split_end_idx = train_rows
+                    print(f"Partitioning single shard: using rows 0-{train_rows} for training (ratio={self.ratio}, {train_rows}/{total_rows} rows)")
+                else:  # val
+                    self.split_start_idx = train_rows
+                    self.split_end_idx = total_rows
+                    print(f"Partitioning single shard: using rows {train_rows}-{total_rows} for validation (ratio={self.ratio}, {total_rows - train_rows}/{total_rows} rows)")
+            else:
+                # Multiple shards: split by shards as before
+                train_shards = int(total_shards * self.ratio)
+                
+                if self.split == 'train':
+                    self.parquet_files = self.parquet_files[:train_shards]
+                    print(f"Using {len(self.parquet_files)} shards for training (ratio={self.ratio})")
+                else:  # val
+                    self.parquet_files = self.parquet_files[train_shards:]
+                    print(f"Using {len(self.parquet_files)} shards for validation (ratio={self.ratio})")
         
         # Initialize lazy loading state
         self.current_file_idx = None
@@ -99,9 +123,17 @@ class PredictionGeoDataset(Dataset):
             # Read just the metadata to get row count
             df_meta = pd.read_parquet(file_path, engine='pyarrow')
             file_rows = len(df_meta)
+            
+            # If we're splitting within a single shard, adjust the row count
+            if self.split_start_idx is not None and i == 0:
+                # This is the single shard being split
+                file_rows = self.split_end_idx - self.split_start_idx
+                print(f"File {i + 1}/{len(self.parquet_files)}: {file_path} ({file_rows} rows, split from {self.split_start_idx} to {self.split_end_idx})")
+            else:
+                print(f"File {i + 1}/{len(self.parquet_files)}: {file_path} ({file_rows} rows)")
+            
             self.file_start_indices.append(self.total_samples)
             self.total_samples += file_rows
-            print(f"File {i + 1}/{len(self.parquet_files)}: {file_path} ({file_rows} rows)")
         
         print(f"Total samples across all files: {self.total_samples}")
         
@@ -191,9 +223,19 @@ class PredictionGeoDataset(Dataset):
         self._load_file_if_needed(file_idx)
         
         samples = []
-        for i in range(len(self.current_df)):
-            # Calculate global index
-            global_idx = self.file_start_indices[file_idx] + i
+        # Determine the range of rows to iterate over
+        if self.split_start_idx is not None and file_idx == 0:
+            # Single shard split: only iterate over the split portion
+            start_row = self.split_start_idx
+            end_row = self.split_end_idx
+        else:
+            start_row = 0
+            end_row = len(self.current_df)
+        
+        for i in range(start_row, end_row):
+            # Calculate global index (relative to the split)
+            local_idx_in_split = i - start_row
+            global_idx = self.file_start_indices[file_idx] + local_idx_in_split
                 
             row = self.current_df.iloc[i]
             
@@ -202,14 +244,17 @@ class PredictionGeoDataset(Dataset):
             if isinstance(image_bytes, str):
                 image_bytes = image_bytes.encode('latin1')
             
-            image = Image.open(BytesIO(image_bytes)).convert('RGB')
+            pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
             
-            # Apply transform if provided
+            # Apply transform if provided, otherwise return PIL image
             if self.transform:
-                image = self.transform(image)
+                image = self.transform(pil_image)
+            else:
+                image = pil_image
             
             sample = {
                 'image': image,
+                'pil_image': pil_image,  # Always include PIL image for plonk
                 'true_lat': torch.tensor(float(row['true_lat'])),
                 'true_lon': torch.tensor(float(row['true_lon'])),
                 'pred_lat': torch.tensor(float(row['pred_lat'])),
@@ -272,6 +317,10 @@ class PredictionGeoDataset(Dataset):
         # Calculate the local index within the current file
         local_idx = idx - self.file_start_indices[file_idx]
         
+        # If we're splitting within a single shard, add the offset
+        if self.split_start_idx is not None and file_idx == 0:
+            local_idx = local_idx + self.split_start_idx
+        
         # Get the row data
         row = self.current_df.iloc[local_idx]
         
@@ -280,14 +329,17 @@ class PredictionGeoDataset(Dataset):
         if isinstance(image_bytes, str):
             image_bytes = image_bytes.encode('latin1')
         
-        image = Image.open(BytesIO(image_bytes)).convert('RGB')
+        pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
         
-        # Apply transform if provided
+        # Apply transform if provided, otherwise return PIL image
         if self.transform:
-            image = self.transform(image)
+            image = self.transform(pil_image)
+        else:
+            image = pil_image
         
         result = {
             'image': image,
+            'pil_image': pil_image,  # Always include PIL image for plonk
             'true_lat': torch.tensor(float(row['true_lat'])),
             'true_lon': torch.tensor(float(row['true_lon'])),
             'pred_lat': torch.tensor(float(row['pred_lat'])),

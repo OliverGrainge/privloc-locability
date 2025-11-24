@@ -1,15 +1,15 @@
 model:
   arch_name: "megaloc"
-  dataset_name: "mp16"
+  dataset_name: "yfcc4k"
   pred_model_name: "geoclip"
   threshold_km: 1000.0  # Distance threshold for binary classification
   learning_rate: 0.0001  # Match classifier learning rate
-  batch_size: 32  # Match classifier batch size
+  batch_size: 1  # Match classifier batch size
   num_workers: 0
   use_weighted_loss: true  # Enable class imbalance handling
 
 trainer:
-  max_steps: 3000  # Maximum number of training steps (-1 for no limit)
+  max_steps: 252  # Maximum number of training steps (-1 for no limit)
   max_epochs: -1  # Use -1 to disable epoch-based training when using steps
   precision: 'bf16-mixed'
   accelerator: 'auto'
@@ -17,7 +17,7 @@ trainer:
   strategy: 'auto'
   log_every_n_steps: 1
   enable_progress_bar: true
-  val_check_interval: 1000  # Run validation every N training steps
+  val_check_interval: 126  # Run validation every N training steps
 
 
 checkpoint: False

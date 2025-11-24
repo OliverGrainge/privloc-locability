@@ -483,10 +483,91 @@ class ConceptLocalizationPredictor(pl.LightningModule):
         random_precision, random_recall, random_thresholds = precision_recall_curve(all_targets, all_random_probs)
         random_auprc = auc(random_recall, random_precision)
         
+        # Compute recall at specific precision thresholds
+        def recall_at_precision(precision_array, recall_array, target_precision):
+            """Find maximum recall where precision >= target_precision."""
+            # Find indices where precision meets or exceeds target
+            valid_indices = precision_array >= target_precision
+            if valid_indices.any():
+                return recall_array[valid_indices].max()
+            return 0.0
+        
+        # Compute precision at specific recall thresholds
+        def precision_at_recall(precision_array, recall_array, target_recall):
+            """Find maximum precision where recall >= target_recall."""
+            # Find indices where recall meets or exceeds target
+            valid_indices = recall_array >= target_recall
+            if valid_indices.any():
+                return precision_array[valid_indices].max()
+            return 0.0
+        
+        recall_at_100_precision = recall_at_precision(precision, recall, 1.0)
+        recall_at_95_precision = recall_at_precision(precision, recall, 0.95)
+        recall_at_90_precision = recall_at_precision(precision, recall, 0.90)
+        recall_at_80_precision = recall_at_precision(precision, recall, 0.80)
+        
+        precision_at_100_recall = precision_at_recall(precision, recall, 1.0)
+        precision_at_95_recall = precision_at_recall(precision, recall, 0.95)
+        precision_at_90_recall = precision_at_recall(precision, recall, 0.90)
+        precision_at_80_recall = precision_at_recall(precision, recall, 0.80)
+        
+        # Compute recall at precision for random predictions
+        random_recall_at_100_precision = recall_at_precision(random_precision, random_recall, 1.0)
+        random_recall_at_95_precision = recall_at_precision(random_precision, random_recall, 0.95)
+        random_recall_at_90_precision = recall_at_precision(random_precision, random_recall, 0.90)
+        random_recall_at_80_precision = recall_at_precision(random_precision, random_recall, 0.80)
+        
+        # Compute precision at recall for random predictions
+        random_precision_at_100_recall = precision_at_recall(random_precision, random_recall, 1.0)
+        random_precision_at_95_recall = precision_at_recall(random_precision, random_recall, 0.95)
+        random_precision_at_90_recall = precision_at_recall(random_precision, random_recall, 0.90)
+        random_precision_at_80_recall = precision_at_recall(random_precision, random_recall, 0.80)
+        
         # Log AUPRCs
         self.log('test/auprc', auprc, prog_bar=True)
         self.log('test/random_auprc', random_auprc, prog_bar=True)
+        
+        # Log recall at precision thresholds
+        self.log('test/recall_at_100_precision', recall_at_100_precision, prog_bar=True)
+        self.log('test/recall_at_95_precision', recall_at_95_precision, prog_bar=True)
+        self.log('test/recall_at_90_precision', recall_at_90_precision, prog_bar=True)
+        self.log('test/recall_at_80_precision', recall_at_80_precision, prog_bar=True)
+        
+        # Log precision at recall thresholds
+        self.log('test/precision_at_100_recall', precision_at_100_recall, prog_bar=True)
+        self.log('test/precision_at_95_recall', precision_at_95_recall, prog_bar=True)
+        self.log('test/precision_at_90_recall', precision_at_90_recall, prog_bar=True)
+        self.log('test/precision_at_80_recall', precision_at_80_recall, prog_bar=True)
+        
+        # Log random recall at precision thresholds
+        self.log('test/random_recall_at_100_precision', random_recall_at_100_precision, prog_bar=True)
+        self.log('test/random_recall_at_95_precision', random_recall_at_95_precision, prog_bar=True)
+        self.log('test/random_recall_at_90_precision', random_recall_at_90_precision, prog_bar=True)
+        self.log('test/random_recall_at_80_precision', random_recall_at_80_precision, prog_bar=True)
+        
+        # Log random precision at recall thresholds
+        self.log('test/random_precision_at_100_recall', random_precision_at_100_recall, prog_bar=True)
+        self.log('test/random_precision_at_95_recall', random_precision_at_95_recall, prog_bar=True)
+        self.log('test/random_precision_at_90_recall', random_precision_at_90_recall, prog_bar=True)
+        self.log('test/random_precision_at_80_recall', random_precision_at_80_recall, prog_bar=True)
+        
         logger.info(f"Test AUPRC: {auprc:.4f}, Random AUPRC: {random_auprc:.4f}")
+        logger.info(f"Recall@Precision - 100%: {recall_at_100_precision:.4f}, "
+                   f"95%: {recall_at_95_precision:.4f}, "
+                   f"90%: {recall_at_90_precision:.4f}, "
+                   f"80%: {recall_at_80_precision:.4f}")
+        logger.info(f"Precision@Recall - 100%: {precision_at_100_recall:.4f}, "
+                   f"95%: {precision_at_95_recall:.4f}, "
+                   f"90%: {precision_at_90_recall:.4f}, "
+                   f"80%: {precision_at_80_recall:.4f}")
+        logger.info(f"Random Recall@Precision - 100%: {random_recall_at_100_precision:.4f}, "
+                   f"95%: {random_recall_at_95_precision:.4f}, "
+                   f"90%: {random_recall_at_90_precision:.4f}, "
+                   f"80%: {random_recall_at_80_precision:.4f}")
+        logger.info(f"Random Precision@Recall - 100%: {random_precision_at_100_recall:.4f}, "
+                   f"95%: {random_precision_at_95_recall:.4f}, "
+                   f"90%: {random_precision_at_90_recall:.4f}, "
+                   f"80%: {random_precision_at_80_recall:.4f}")
         
         # Create combined PR curve plot (model + random baseline)
         fig, ax = plt.subplots(figsize=(8, 6))

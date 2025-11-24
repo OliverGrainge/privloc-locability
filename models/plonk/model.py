@@ -20,16 +20,55 @@ import numpy as np
 from sklearn.metrics import precision_recall_curve, auc
 import matplotlib.pyplot as plt
 import io
-
-
-
-from .archs import load_arch_and_transform
+from plonk.pipe import PlonkPipeline
+from PIL import Image
 from data.datasets import load_prediction_dataset
 
 logger = logging.getLogger(__name__)
 
 
-class BinaryErrorClassifier(pl.LightningModule):
+def collate_fn_pil(batch):
+    """
+    Custom collate function that handles PIL images in batches.
+    PIL images are kept as a list, while tensors are stacked.
+    """
+    from torch.utils.data.dataloader import default_collate
+    from PIL import Image
+    
+    # Separate PIL images from other data
+    # Check if 'image' is also a PIL Image (when transform=None)
+    pil_images = [item['pil_image'] for item in batch]
+    images = []
+    if 'image' in batch[0] and isinstance(batch[0]['image'], Image.Image):
+        images = [item['image'] for item in batch]
+    
+    # Create a list of dicts without PIL image keys for default_collate
+    # default_collate expects a list/tuple, not a dict
+    # Remove both 'pil_image' and 'image' if it's a PIL Image
+    batch_without_pil = []
+    for item in batch:
+        filtered_item = {}
+        for key, value in item.items():
+            # Skip PIL images - we'll add them back later
+            if key == 'pil_image':
+                continue
+            if key == 'image' and isinstance(value, Image.Image):
+                continue
+            filtered_item[key] = value
+        batch_without_pil.append(filtered_item)
+    
+    # Use default collate on the list of dicts (only tensors/numbers now)
+    collated = default_collate(batch_without_pil)
+    
+    # Add PIL images as lists (not stacked)
+    collated['pil_image'] = pil_images
+    if images:
+        collated['image'] = images
+    
+    return collated
+
+
+class PlonkModule(pl.LightningModule):
     """
     Binary classifier for geolocation error prediction with class imbalance handling.
     
@@ -76,8 +115,12 @@ class BinaryErrorClassifier(pl.LightningModule):
         self.save_hyperparameters()
         
         # Load backbone architecture
-        self.model, self.transform = load_arch_and_transform(arch_name)
+        #self.model, self.transform = load_arch_and_transform(arch_name)
+        # Initialize PLONK pipeline lazily to avoid device conflicts with PyTorch Lightning
+        self._plonk = None
+        self._plonk_model_path = "nicolas-dufour/PLONK_YFCC"
         
+        self.fc1 = nn.Linear(1, 1)
         # Loss function configuration
         self.use_weighted_loss = use_weighted_loss
         self.use_focal_loss = use_focal_loss
@@ -102,18 +145,106 @@ class BinaryErrorClassifier(pl.LightningModule):
         self.test_targets: List[torch.Tensor] = []
         self.test_random_predictions: List[torch.Tensor] = []
 
+    def setup(self, stage: Optional[str] = None) -> None:
+        """Called after the device is set by PyTorch Lightning."""
+        super().setup(stage)
+        # Initialize PLONK pipeline after device is set
+        if self._plonk is None:
+            # Get device from PyTorch Lightning as torch.device object
+            try:
+                device = self.device
+                if isinstance(device, torch.device):
+                    pass  # Already a device object
+                elif isinstance(device, (list, tuple)) and len(device) > 0:
+                    device = device[0]  # Get first device if multiple
+                else:
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            except (AttributeError, RuntimeError):
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"Initializing PLONK pipeline on device: {device}")
+            print(f"PyTorch Lightning device: {self.device}")
+            print(f"CUDA available: {torch.cuda.is_available()}")
+            self._plonk = PlonkPipeline(self._plonk_model_path, device=device)
+            print("PLONK pipeline initialized successfully")
+            # Verify device placement
+            if hasattr(self._plonk, 'network'):
+                network_device = next(self._plonk.network.parameters()).device
+                print(f"PLONK network device: {network_device}")
+                print(f"PLONK pipeline device attribute: {getattr(self._plonk, 'device', 'N/A')}")
+                if network_device.type != device.type:
+                    print(f"WARNING: Device mismatch! Expected {device}, but network is on {network_device}")
+            else:
+                print("WARNING: Could not find network attribute in PlonkPipeline")
+    
+    @property
+    def plonk(self):
+        """Lazy initialization of PLONK pipeline to avoid device conflicts."""
+        if self._plonk is None:
+            # Try to get device from PyTorch Lightning
+            try:
+                # PyTorch Lightning device property (available after setup)
+                if hasattr(self, 'device'):
+                    device = self.device
+                    if isinstance(device, (list, tuple)) and len(device) > 0:
+                        device = device[0]  # Get first device if multiple
+                    if not isinstance(device, torch.device):
+                        # Convert string or other format to torch.device
+                        device_str = str(device)
+                        if 'cuda' in device_str.lower() and torch.cuda.is_available():
+                            device = torch.device('cuda')
+                        else:
+                            device = torch.device('cpu')
+                else:
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            except (AttributeError, RuntimeError) as e:
+                # Fallback to CPU if device not available yet
+                print(f"Warning: Could not get device, using CPU. Error: {e}")
+                device = torch.device('cpu')
+            print(f"Lazy initializing PLONK pipeline on device: {device}")
+            print(f"PyTorch Lightning device: {getattr(self, 'device', 'N/A')}")
+            print(f"CUDA available: {torch.cuda.is_available()}")
+            self._plonk = PlonkPipeline(self._plonk_model_path, device=device)
+            print("PLONK pipeline lazy initialized successfully")
+            # Verify device placement
+            if hasattr(self._plonk, 'network'):
+                network_device = next(self._plonk.network.parameters()).device
+                print(f"PLONK network device: {network_device}")
+                print(f"PLONK pipeline device attribute: {getattr(self._plonk, 'device', 'N/A')}")
+                if network_device.type != device.type:
+                    print(f"WARNING: Device mismatch! Expected {device}, but network is on {network_device}")
+        return self._plonk
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, pil_images: List, coordinates: List[List[float]]) -> torch.Tensor:
         """
         Forward pass through the model.
         
         Args:
-            x: Input image tensor [batch_size, channels, height, width]
+            pil_images: List of PIL Images [batch_size]
+            coordinates: List of coordinate pairs [[lat, lon], ...] [batch_size]
             
         Returns:
             Logits [batch_size]
         """
-        return self.model(x)
+        print(f"Forward: accessing plonk (initialized: {self._plonk is not None})")
+        plonk_pipeline = self.plonk
+        # Verify device before computation
+        if hasattr(plonk_pipeline, 'network'):
+            network_device = next(plonk_pipeline.network.parameters()).device
+            print(f"Forward: PLONK network is on device: {network_device}")
+            print(f"Forward: Model device: {self.device}")
+        print(f"Forward: got plonk pipeline, calling compute_likelihood with {len(pil_images)} images")
+        with torch.no_grad():
+            likelihood = plonk_pipeline.compute_likelihood(images=pil_images, coordinates=coordinates, rademacher=True)
+        print(f"Forward: got likelihood shape {likelihood.shape}, device: {likelihood.device}")
+        
+        # Ensure likelihood has the right shape for fc1: [batch_size, 1]
+        # compute_likelihood returns [batch_size], so we need to add a dimension
+        if likelihood.dim() == 1:
+            likelihood = likelihood.unsqueeze(-1)  # [batch_size] -> [batch_size, 1]
+        
+        logits = self.fc1(likelihood).squeeze(-1)  # [batch_size, 1] -> [batch_size]
+        print(f"Forward: returning logits shape {logits.shape}, device: {logits.device}")
+        return logits
     
     def _focal_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -287,13 +418,20 @@ class BinaryErrorClassifier(pl.LightningModule):
         Training step.
         
         Args:
-            batch: Batch with keys: 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
+            batch: Batch with keys: 'pil_image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
             batch_idx: Batch index
             
         Returns:
             Training loss
         """
-        images = batch['image']
+        print("training step")
+        # Extract PIL images and TRUE coordinates
+        pil_images = batch['pil_image']  # List of PIL Images
+        true_lat = batch['true_lat'].cpu().numpy()
+        true_lon = batch['true_lon'].cpu().numpy()
+        
+        # Convert TRUE coordinates to list of [lat, lon] pairs for plonk
+        coordinates = [[float(lat), float(lon)] for lat, lon in zip(true_lat, true_lon)]
         
         # Calculate geodetic error
         error_km = self._calculate_geodetic_error(
@@ -329,8 +467,8 @@ class BinaryErrorClassifier(pl.LightningModule):
                     # Use exponential moving average for stability
                     self.pos_weight = 0.9 * self.pos_weight + 0.1 * new_pos_weight
         
-        # Forward pass
-        logits = self(images)
+        # Forward pass with PIL images and coordinates
+        logits = self(pil_images, coordinates)
         
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
@@ -348,10 +486,17 @@ class BinaryErrorClassifier(pl.LightningModule):
         Validation step.
         
         Args:
-            batch: Batch with keys: 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
+            batch: Batch with keys: 'pil_image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
             batch_idx: Batch index
         """
-        images = batch['image']
+        print("validation step")
+        # Extract PIL images and TRUE coordinates
+        pil_images = batch['pil_image']  # List of PIL Images
+        true_lat = batch['true_lat'].cpu().numpy()
+        true_lon = batch['true_lon'].cpu().numpy()
+        
+        # Convert TRUE coordinates to list of [lat, lon] pairs for plonk
+        coordinates = [[float(lat), float(lon)] for lat, lon in zip(true_lat, true_lon)]
         
         # Calculate geodetic error
         error_km = self._calculate_geodetic_error(
@@ -365,8 +510,8 @@ class BinaryErrorClassifier(pl.LightningModule):
         # Log class distribution and baselines (once per epoch)
         self._log_class_distribution(targets, 'val')
         
-        # Forward pass
-        logits = self(images)
+        # Forward pass with PIL images and coordinates
+        logits = self(pil_images, coordinates)
         
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
@@ -382,10 +527,16 @@ class BinaryErrorClassifier(pl.LightningModule):
         Test step with collection of predictions for PR curve.
         
         Args:
-            batch: Batch with keys: 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
+            batch: Batch with keys: 'pil_image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
             batch_idx: Batch index
         """
-        images = batch['image']
+        # Extract PIL images and TRUE coordinates
+        pil_images = batch['pil_image']  # List of PIL Images
+        true_lat = batch['true_lat'].cpu().numpy()
+        true_lon = batch['true_lon'].cpu().numpy()
+        
+        # Convert TRUE coordinates to list of [lat, lon] pairs for plonk
+        coordinates = [[float(lat), float(lon)] for lat, lon in zip(true_lat, true_lon)]
         
         # Calculate geodetic error
         error_km = self._calculate_geodetic_error(
@@ -399,8 +550,8 @@ class BinaryErrorClassifier(pl.LightningModule):
         # Log class distribution and baselines
         self._log_class_distribution(targets, 'test')
         
-        # Forward pass
-        logits = self(images)
+        # Forward pass with PIL images and coordinates
+        logits = self(pil_images, coordinates)
         
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
@@ -580,8 +731,12 @@ class BinaryErrorClassifier(pl.LightningModule):
         self.test_random_predictions.clear()
     
     def configure_optimizers(self):
-        """Configure optimizer with cosine annealing scheduler."""
-        optimizer = Adam(self.parameters(), lr=self.hparams.learning_rate)
+        """Configure optimizer with cosine annealing scheduler.
+        
+        Only fc1 parameters will be optimized (PLONK is frozen).
+        """
+        # Explicitly only optimize fc1 parameters to ensure PLONK stays frozen
+        optimizer = Adam(self.fc1.parameters(), lr=self.hparams.learning_rate)
         return optimizer
     
     def train_dataloader(self) -> DataLoader:
@@ -589,7 +744,7 @@ class BinaryErrorClassifier(pl.LightningModule):
         dataset = load_prediction_dataset(
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
-            transform=self.transform,
+            transform=None,
             max_shards = 10,
             split = "train",
             ratio = 0.9,
@@ -605,6 +760,7 @@ class BinaryErrorClassifier(pl.LightningModule):
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=drop_last,
+            collate_fn=collate_fn_pil,
         )
 
 
@@ -613,7 +769,7 @@ class BinaryErrorClassifier(pl.LightningModule):
         dataset = load_prediction_dataset(
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
-            transform=self.transform,
+            transform=None,  # No transform needed, we use PIL images for plonk
             max_shards = 10,
             split = "val",
             ratio = 0.9,
@@ -629,6 +785,7 @@ class BinaryErrorClassifier(pl.LightningModule):
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=drop_last,
+            collate_fn=collate_fn_pil,
         )
 
 
@@ -637,7 +794,7 @@ class BinaryErrorClassifier(pl.LightningModule):
         dataset = load_prediction_dataset(
             dataset_name=self.hparams.dataset_name,
             model_name=self.hparams.pred_model_name,
-            transform=self.transform,
+            transform=None,  # No transform needed, we use PIL images for plonk
             max_shards = 10,
             split = "val",
             ratio = 0.9,
@@ -653,4 +810,5 @@ class BinaryErrorClassifier(pl.LightningModule):
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=drop_last,
+            collate_fn=collate_fn_pil,
         )

@@ -11,4 +11,4 @@ parameters:
   batch_size: 128
   num_workers: 6
   max_shards: null
-  embeddings: True
+  embeddings: false
