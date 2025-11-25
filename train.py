@@ -12,15 +12,21 @@ import argparse
 import os
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Type
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
-from models.binaryclassifer.model import BinaryClassifier
+from models import BinaryClassifier, ConditionalVAEClassifier
 from data.datasets import load_prediction_dataset, prediction_collate_fn
+
+
+MODEL_REGISTRY: Dict[str, Type[pl.LightningModule]] = {
+    "binary_classifier": BinaryClassifier,
+    "conditional_vae": ConditionalVAEClassifier,
+}
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -97,22 +103,38 @@ def setup_logger(config: Dict[str, Any], config_dir: Path, config_name: str) -> 
 
 
 
-def create_model(config: Dict[str, Any]) -> BinaryClassifier:
+def parse_model_config(model_config: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """
-    Create the binary error classifier from configuration.
+    Extract the model type and parameters from the configuration.
+    """
+    if 'type' not in model_config:
+        raise ValueError("Model configuration must include a 'type' field.")
     
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        Initialized BinaryClassifier
+    model_type = model_config['type'].lower()
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model type '{model_type}'. "
+                         f"Available types: {sorted(MODEL_REGISTRY.keys())}")
+    
+    if 'params' in model_config:
+        model_params = model_config['params']
+    else:
+        model_params = {k: v for k, v in model_config.items() if k != 'type'}
+    
+    if not isinstance(model_params, dict):
+        raise ValueError("Model 'params' must be a dictionary of keyword arguments.")
+    
+    return model_type, model_params
+
+
+def create_model(model_type: str, model_params: Dict[str, Any]) -> pl.LightningModule:
     """
-    model_config = config['model']
-    model = BinaryClassifier(**model_config)
-    return model
+    Instantiate the requested LightningModule using the provided parameters.
+    """
+    model_cls = MODEL_REGISTRY[model_type]
+    return model_cls(**model_params)
 
 
-def create_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, List[DataLoader]]:
+def create_dataloaders(model: pl.LightningModule, config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, List[DataLoader]]:
     """
     Create train, validation, and test dataloaders.
     
@@ -132,11 +154,13 @@ def create_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> Tuple
     train_batch_size = train_config['batch_size']
     train_num_workers = train_config['num_workers']
     
+    transform = getattr(model, "transform", None)
+    
     # Create training dataloader
     train_dataset = load_prediction_dataset(
         dataset_name=train_dataset_name,
         model_name=train_pred_model_name,
-        transform=model.transform,
+        transform=transform,
         split="train",
     )
     drop_last_train = len(train_dataset) > train_batch_size
@@ -154,7 +178,7 @@ def create_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> Tuple
     val_dataset = load_prediction_dataset(
         dataset_name=train_dataset_name,
         model_name=train_pred_model_name,
-        transform=model.transform,
+        transform=transform,
         split="val",
     )
     drop_last_val = len(val_dataset) > train_batch_size
@@ -184,7 +208,7 @@ def create_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> Tuple
             test_dataset = load_prediction_dataset(
                 dataset_name=dataset_name,
                 model_name=test_pred_model_name,
-                transform=model.transform,
+                transform=transform,
                 split="test",
             )
             drop_last_test = len(test_dataset) > test_batch_size
@@ -275,9 +299,12 @@ def main():
     print(f"Checkpoints will be saved to: {config_dir / 'checkpoints'}")
     print(f"Logs will be saved to: {config_dir / 'logs'}")
     
+    # Determine model type / params
+    model_type, model_params = parse_model_config(config['model'])
+    
     # Create model
     print("Creating model...")
-    model = create_model(config)
+    model = create_model(model_type, model_params)
     
     # Setup trainer
     print("Setting up trainer...")
@@ -285,9 +312,9 @@ def main():
     
     # Print model summary
     print("\nModel Summary:")
-    print(f"Architecture: {config['model']['arch_name']}")
-    print(f"Threshold: {config['model']['threshold_km']} km")
-    print(f"Learning Rate: {config['model']['learning_rate']}")
+    print(f"Type: {model_type}")
+    for key, value in model_params.items():
+        print(f"  {key}: {value}")
     
     # Print data summary
     print("\nData Configuration:")

@@ -434,7 +434,7 @@ class BinaryClassifier(pl.LightningModule):
 
         # Create probability distribution histogram
         if len(self.test_probs_list) > 0:
-            all_probs = torch.cat(self.test_probs_list, dim=0).numpy()
+            all_probs = torch.cat(self.test_probs_list, dim=0).to(torch.float32).numpy()
             
             fig_dist, ax_dist = plt.subplots(figsize=(8, 6))
             ax_dist.hist(all_probs, bins=50, edgecolor='black', alpha=0.7)

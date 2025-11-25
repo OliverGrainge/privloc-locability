@@ -1,4 +1,5 @@
 model:
+  type: "binary_classifier"
   arch_name: "megaloc"
   threshold_km: 1000.0  # Distance threshold for binary classification
   learning_rate: 0.0001  # Match classifier learning rate

@@ -21,3 +21,4 @@ config: {'_wandb': {}}
 2025-11-25 05:43:30,533 INFO    MainThread:2846440 [wandb_run.py:_redirect():2506] Redirects installed.
 2025-11-25 05:43:30,539 INFO    MainThread:2846440 [wandb_init.py:init():1147] run started, returning control to user process
 2025-11-25 05:43:30,766 INFO    MainThread:2846440 [wandb_run.py:_config_callback():1429] config_cb None None {'arch_name': 'megaloc', 'threshold_km': 1000.0, 'learning_rate': 0.0001, 'use_weighted_loss': True, 'weight_positive': 1.0, 'use_focal_loss': False, 'focal_loss_alpha': 0.25, 'focal_loss_gamma': 2.0}
+2025-11-25 06:15:09,184 INFO    MsgRouterThr:2846440 [mailbox.py:close():129] [no run ID] Closing mailbox, abandoning 0 handles.

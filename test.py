@@ -13,7 +13,7 @@ import os
 import yaml
 import csv
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from datetime import datetime
 
 import pytorch_lightning as pl
@@ -21,8 +21,14 @@ from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from models.binaryclassifer.model import BinaryClassifier
+from models import BinaryClassifier, ConditionalVAEClassifier
 from data.datasets import load_prediction_dataset, prediction_collate_fn
+
+
+MODEL_REGISTRY = {
+    "binary_classifier": BinaryClassifier,
+    "conditional_vae": ConditionalVAEClassifier,
+}
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -40,7 +46,30 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
-def create_test_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> List[DataLoader]:
+def parse_model_config(model_config: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Extract model type and parameters from configuration.
+    """
+    if 'type' not in model_config:
+        raise ValueError("Model configuration must include a 'type' field.")
+
+    model_type = model_config['type'].lower()
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model type '{model_type}'. "
+                         f"Available types: {sorted(MODEL_REGISTRY.keys())}")
+
+    if 'params' in model_config:
+        model_params = model_config['params']
+    else:
+        model_params = {k: v for k, v in model_config.items() if k != 'type'}
+
+    if not isinstance(model_params, dict):
+        raise ValueError("Model 'params' must be a dictionary of keyword arguments.")
+
+    return model_type, model_params
+
+
+def create_test_dataloaders(model: pl.LightningModule, config: Dict[str, Any]) -> List[DataLoader]:
     """
     Create test dataloaders from config.
     
@@ -66,7 +95,7 @@ def create_test_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> 
             test_dataset = load_prediction_dataset(
                 dataset_name=dataset_name,
                 model_name=test_pred_model_name,
-                transform=model.transform,
+                transform=getattr(model, "transform", None),
                 split="test",
             )
             drop_last_test = len(test_dataset) > test_batch_size
@@ -84,7 +113,7 @@ def create_test_dataloaders(model: BinaryClassifier, config: Dict[str, Any]) -> 
     return test_loaders
 
 
-def extract_metrics_from_trainer(trainer: pl.Trainer, model: BinaryClassifier, dataset_name: str) -> Dict[str, Any]:
+def extract_metrics_from_trainer(trainer: pl.Trainer, model: pl.LightningModule, dataset_name: str) -> Dict[str, Any]:
     """
     Extract metrics from trainer and model.
     
@@ -322,9 +351,12 @@ def main():
     
     # Create model
     print("\nLoading model from checkpoint...")
-    model = BinaryClassifier.load_from_checkpoint(
+    model_type, model_params = parse_model_config(config['model'])
+    model_cls = MODEL_REGISTRY[model_type]
+    model = model_cls.load_from_checkpoint(
         str(checkpoint_path),
-        strict=False  # Allow missing keys if config changed
+        strict=False,
+        **model_params,
     )
     
     # Create test dataloaders
