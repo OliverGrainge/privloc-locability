@@ -9,12 +9,41 @@ from pathlib import Path
 import glob
 from tqdm import tqdm 
 from torchvision import transforms
+from torch.utils.data._utils.collate import default_collate
+
+
+def prediction_collate_fn(batch):
+    """
+    Custom collate function for prediction datasets that handles PIL Images.
+    
+    PIL Images are kept as lists instead of being stacked, since they can't be batched.
+    All other fields use the default collate function.
+    """
+    from PIL import Image as PILImage
+    
+    # Separate PIL Images from other data
+    pil_image_key = 'pil_image'
+    pil_images = []
+    other_data = []
+    
+    for item in batch:
+        if pil_image_key in item:
+            pil_images.append(item.pop(pil_image_key))
+        other_data.append(item)
+    
+    # Use default collate for the rest
+    batch_dict = default_collate(other_data)
+    
+    # Add PIL images as a list
+    if pil_images:
+        batch_dict[pil_image_key] = pil_images
+    
+    return batch_dict
 
 
 class PredictionBaseDataset(Dataset):
     """
     Base PyTorch Dataset for loading prediction results from parquet files.
-    Supports both single parquet files and sharded parquet files.
     
     The parquet files contain:
         - 'image_bytes': binary image data (JPEG format)
@@ -27,29 +56,16 @@ class PredictionBaseDataset(Dataset):
     
     def __init__(
         self,
-        parquet_path: Union[str, Path],
+        parquet_files: List[Union[str, Path]],
         transform: Optional[Callable] = None,
     ):
         """
         Args:
-            parquet_path: Path to parquet file/directory containing prediction results.
-                         Can be a single file or a directory containing sharded files (part_*.parquet)
+            parquet_files: List of parquet file paths (shard file paths)
             transform: Optional torchvision transform to apply to images
         """
-        self.parquet_path = Path(parquet_path)
         self.transform = transform
-        
-        # Determine if we have a single file or sharded files
-        if self.parquet_path.is_file():
-            # Single parquet file
-            self.parquet_files = [self.parquet_path]
-        elif self.parquet_path.is_dir():
-            # Directory with sharded files
-            self.parquet_files = sorted(self.parquet_path.glob("part_*.parquet"))
-            if not self.parquet_files:
-                raise FileNotFoundError(f"No parquet files found in directory: {self.parquet_path}")
-        else:
-            raise FileNotFoundError(f"Parquet path not found: {self.parquet_path}")
+        self.parquet_files = [Path(f) for f in parquet_files]
 
         # Initialize lazy loading state
         self.current_file_idx = None
@@ -168,11 +184,12 @@ class PredictionBaseDataset(Dataset):
             
             pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
             
-            # Apply transform if provided, otherwise return PIL image
+            # Apply transform if provided, otherwise convert to tensor
             if self.transform:
                 image = self.transform(pil_image)
             else:
-                image = pil_image
+                # Default: convert PIL image to tensor
+                image = transforms.ToTensor()(pil_image)
             
             sample = {
                 'image': image,
@@ -249,15 +266,21 @@ class PredictionBaseDataset(Dataset):
         
         pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
         
-        # Apply transform if provided, otherwise return PIL image
+        # Apply transform if provided, otherwise resize and convert to tensor
         if self.transform:
             image = self.transform(pil_image)
         else:
-            image = pil_image
+            # Default: resize to fixed size and convert to tensor for batching
+            # Use 224x224 as a standard size for vision models
+            default_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor()
+            ])
+            image = default_transform(pil_image)
         
         result = {
             'image': image,
-            'pil_image': pil_image,  # Always include PIL image for plonk
+            'pil_image': pil_image, 
             'true_lat': torch.tensor(float(row['true_lat'])),
             'true_lon': torch.tensor(float(row['true_lon'])),
             'pred_lat': torch.tensor(float(row['pred_lat'])),
@@ -307,7 +330,6 @@ class PredictionBaseDataset(Dataset):
         
         return {
             'total_samples': self.total_samples,
-            'parquet_path': str(self.parquet_path),
             'parquet_files': parquet_files,
             'num_shards': len(parquet_files),
             'columns': columns,
@@ -328,188 +350,39 @@ class Mp16PredictionDataset(PredictionBaseDataset):
     
     def __init__(
         self,
-        parquet_path: Union[str, Path],
-        transform: Optional[Callable] = None,
-        split: Optional[str] = None,
-        train_ratio: float = 0.9,
+        parquet_files: Union[str, Path],
+        split: str,
+        transform: Optional[Callable] = None
     ):
         """
         Args:
-            parquet_path: Path to parquet file/directory containing prediction results
+            parquet_files: Path to directory containing parquet shard files (part_*.parquet)
+            split: Split to use ('train', 'val', or 'test')
             transform: Optional torchvision transform to apply to images
-            split: Split to use ('train' or 'val'). If None, uses all data.
-            train_ratio: Ratio of data to use for training (default 0.9 = 90% train, 10% val)
         """
-        # First, initialize the base dataset to get all files
-        super().__init__(parquet_path, transform)
+        # Find all parquet files in the directory
+        parquet_path = Path(parquet_files)
+        all_parquet_files = sorted(parquet_path.glob("part_*.parquet"))
         
-        self.split = split
-        self.train_ratio = train_ratio
+        if not all_parquet_files:
+            raise FileNotFoundError(f"No parquet files found in directory: {parquet_path}")
         
-        # Apply split logic if specified
-        self.split_start_idx = None
-        self.split_end_idx = None
+        # Apply split logic: 50% train, 50% val
+        if split not in ['train', 'val', 'test']:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got '{split}'")
         
-        if self.split is not None:
-            if self.split not in ['train', 'val']:
-                raise ValueError(f"Split must be 'train' or 'val', got '{self.split}'")
-            
-            total_shards = len(self.parquet_files)
-            
-            # If only 1 shard, partition data within the shard
-            if total_shards == 1:
-                # Get the total number of rows in the single shard
-                df_meta = pd.read_parquet(self.parquet_files[0], engine='pyarrow')
-                total_rows = len(df_meta)
-                train_rows = int(total_rows * self.train_ratio)
-                
-                if self.split == 'train':
-                    self.split_start_idx = 0
-                    self.split_end_idx = train_rows
-                    self.total_samples = train_rows
-                    print(f"Partitioning single shard: using rows 0-{train_rows} for training (ratio={self.train_ratio}, {train_rows}/{total_rows} rows)")
-                else:  # val
-                    self.split_start_idx = train_rows
-                    self.split_end_idx = total_rows
-                    self.total_samples = total_rows - train_rows
-                    print(f"Partitioning single shard: using rows {train_rows}-{total_rows} for validation (ratio={self.train_ratio}, {self.total_samples}/{total_rows} rows)")
-            else:
-                # Multiple shards: split by shards
-                train_shards = int(total_shards * self.train_ratio)
-                
-                if self.split == 'train':
-                    self.parquet_files = self.parquet_files[:train_shards]
-                    # Recalculate total_samples and file_start_indices
-                    self._recalculate_indices()
-                    print(f"Using {len(self.parquet_files)} shards for training (ratio={self.train_ratio})")
-                else:  # val
-                    self.parquet_files = self.parquet_files[train_shards:]
-                    # Recalculate total_samples and file_start_indices
-                    self._recalculate_indices()
-                    print(f"Using {len(self.parquet_files)} shards for validation (ratio={self.train_ratio})")
-    
-    def _recalculate_indices(self):
-        """Recalculate file_start_indices and total_samples after filtering parquet_files."""
-        self.file_start_indices = []
-        self.total_samples = 0
+        total_shards = len(all_parquet_files)
+        split_point = total_shards // 2
         
-        for i, file_path in enumerate(self.parquet_files):
-            df_meta = pd.read_parquet(file_path, engine='pyarrow')
-            file_rows = len(df_meta)
-            self.file_start_indices.append(self.total_samples)
-            self.total_samples += file_rows
-    
-    def __getitem__(self, idx: int) -> dict:
-        """Override to handle single-shard split."""
-        if idx < 0 or idx >= len(self):
-            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+        if split == 'train':
+            selected_parquet_files = all_parquet_files[:split_point]
+            print(f"Using {len(selected_parquet_files)}/{total_shards} shards for training (50% split)")
+        else:  # val or test
+            selected_parquet_files = all_parquet_files[split_point:]
+            print(f"Using {len(selected_parquet_files)}/{total_shards} shards for {split} (50% split)")
         
-        # If we're splitting within a single shard, adjust the index
-        if self.split_start_idx is not None:
-            # Find which file contains this index (should be file 0 for single shard split)
-            file_idx = 0
-            self._load_file_if_needed(file_idx)
-            
-            # Calculate the local index within the split portion
-            local_idx = self.split_start_idx + idx
-            
-            # Get the row data
-            row = self.current_df.iloc[local_idx]
-        else:
-            # Use parent implementation for multi-shard splits
-            return super().__getitem__(idx)
-        
-        # Decode image from bytes
-        image_bytes = row['image_bytes']
-        if isinstance(image_bytes, str):
-            image_bytes = image_bytes.encode('latin1')
-        
-        pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
-        
-        # Apply transform if provided, otherwise return PIL image
-        if self.transform:
-            image = self.transform(pil_image)
-        else:
-            image = pil_image
-        
-        result = {
-            'image': image,
-            'pil_image': pil_image,
-            'true_lat': torch.tensor(float(row['true_lat'])),
-            'true_lon': torch.tensor(float(row['true_lon'])),
-            'pred_lat': torch.tensor(float(row['pred_lat'])),
-            'pred_lon': torch.tensor(float(row['pred_lon'])),
-            'idx': torch.tensor(idx)
-        }
-        
-        # Add embedding if available
-        if self.has_embeddings and 'embedding' in row:
-            import numpy as np
-            embedding_bytes = row['embedding']
-            if isinstance(embedding_bytes, bytes):
-                embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-                result['embedding'] = torch.tensor(embedding)
-        
-        return result
-    
-    def get_file_samples(self, file_idx: int) -> List[dict]:
-        """Override to handle single-shard split."""
-        if file_idx < 0 or file_idx >= len(self.parquet_files):
-            raise IndexError(f"File index {file_idx} out of range for {len(self.parquet_files)} files")
-        
-        self._load_file_if_needed(file_idx)
-        
-        samples = []
-        # Determine the range of rows to iterate over
-        if self.split_start_idx is not None and file_idx == 0:
-            # Single shard split: only iterate over the split portion
-            start_row = self.split_start_idx
-            end_row = self.split_end_idx
-        else:
-            start_row = 0
-            end_row = len(self.current_df)
-        
-        for i in range(start_row, end_row):
-            # Calculate global index (relative to the split)
-            local_idx_in_split = i - start_row
-            global_idx = local_idx_in_split
-                
-            row = self.current_df.iloc[i]
-            
-            # Decode image from bytes
-            image_bytes = row['image_bytes']
-            if isinstance(image_bytes, str):
-                image_bytes = image_bytes.encode('latin1')
-            
-            pil_image = Image.open(BytesIO(image_bytes)).convert('RGB')
-            
-            # Apply transform if provided, otherwise return PIL image
-            if self.transform:
-                image = self.transform(pil_image)
-            else:
-                image = pil_image
-            
-            sample = {
-                'image': image,
-                'pil_image': pil_image,
-                'true_lat': torch.tensor(float(row['true_lat'])),
-                'true_lon': torch.tensor(float(row['true_lon'])),
-                'pred_lat': torch.tensor(float(row['pred_lat'])),
-                'pred_lon': torch.tensor(float(row['pred_lon'])),
-                'idx': torch.tensor(global_idx)
-            }
-            
-            # Add embedding if available
-            if self.has_embeddings and 'embedding' in row:
-                import numpy as np
-                embedding_bytes = row['embedding']
-                if isinstance(embedding_bytes, bytes):
-                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-                    sample['embedding'] = torch.tensor(embedding)
-            
-            samples.append(sample)
-        
-        return samples
+        # Pass the selected parquet files to the base class
+        super().__init__(selected_parquet_files, transform)
 
 
 class Yfcc4kPredictionDataset(PredictionBaseDataset):
@@ -518,7 +391,31 @@ class Yfcc4kPredictionDataset(PredictionBaseDataset):
     
     YFCC4K is a test/validation dataset only - no train/val split needed.
     """
-    pass  # No additional logic needed, just use the base class
+    
+    def __init__(
+        self,
+        parquet_files: Union[str, Path],
+        split: str,
+        transform: Optional[Callable] = None
+    ):
+        """
+        Args:
+            parquet_files: Path to directory containing parquet shard files (part_*.parquet)
+            split: Split to use ('val' or 'test')
+            transform: Optional torchvision transform to apply to images
+        """
+        if split not in ['val', 'test']:
+            raise ValueError(f"Split must be 'val' or 'test', got '{split}'")
+        
+        # Find all parquet files in the directory
+        parquet_path = Path(parquet_files)
+        all_parquet_files = sorted(parquet_path.glob("part_*.parquet"))
+        
+        if not all_parquet_files:
+            raise FileNotFoundError(f"No parquet files found in directory: {parquet_path}")
+        
+        # Pass all parquet files to the base class
+        super().__init__(all_parquet_files, transform)
 
 
 class Im2gps3kPredictionDataset(PredictionBaseDataset):
@@ -527,9 +424,30 @@ class Im2gps3kPredictionDataset(PredictionBaseDataset):
     
     Im2GPS3K is a test/validation dataset only - no train/val split needed.
     """
-    pass  # No additional logic needed, just use the base class
+    
+    def __init__(
+        self,
+        parquet_files: Union[str, Path],
+        split: str,
+        transform: Optional[Callable] = None
+    ):
+        """
+        Args:
+            parquet_files: Path to directory containing parquet shard files (part_*.parquet)
+            split: Split to use ('val' or 'test')
+            transform: Optional torchvision transform to apply to images
+        """
+        if split not in ['val', 'test']:
+            raise ValueError(f"Split must be 'val' or 'test', got '{split}'")
+        
+        # Find all parquet files in the directory
+        parquet_path = Path(parquet_files)
+        all_parquet_files = sorted(parquet_path.glob("part_*.parquet"))
+        
+        if not all_parquet_files:
+            raise FileNotFoundError(f"No parquet files found in directory: {parquet_path}")
+        
+        # Pass all parquet files to the base class
+        super().__init__(all_parquet_files, transform)
 
 
-# Backward compatibility alias
-PredictionDataset = PredictionBaseDataset
-PredictionGeoDataset = PredictionBaseDataset

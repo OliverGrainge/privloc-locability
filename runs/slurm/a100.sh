@@ -16,9 +16,10 @@ ARGS="$@"
 NODES=1
 NTASKS=1
 GPUS=1
-CPUS=8
-TIME="22:00:00"
-PARTITION="dual_h200"
+CPUS=12
+TIME="12:00:00"
+
+PARTITION="a100"
 
 # Generate job name from script name with timestamp and optional config info
 BASE_NAME=$(basename "$PYTHON_SCRIPT" .py)

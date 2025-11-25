@@ -1,12 +1,14 @@
-from data.datasets import load_prediction_dataset
+from dotenv import load_dotenv 
+load_dotenv()
+from data.datasets import load_prediction_dataset, prediction_collate_fn
 from torch.utils.data import DataLoader
 import torch
 
 
 dataset_tests = {
-    "mp16": ["train", "val"],
-    "yfcc4k": [None],  # No split needed for test datasets
-    "im2gps3k": [None],  # No split needed for test datasets
+    "mp16": ["train", "val", "test"],
+    "yfcc4k": ["val", "test"],  # No split needed for test datasets
+    "im2gps3k": ["val", "test"],  # No split needed for test datasets
 }
 
 pred_model_name = "geoclip"
@@ -45,7 +47,8 @@ def test_dataset(dataset_name: str, split: str = None):
             dataset, 
             batch_size=batch_size, 
             shuffle=False,
-            num_workers=0  # Use 0 for testing to avoid multiprocessing issues
+            num_workers=0,  # Use 0 for testing to avoid multiprocessing issues
+            collate_fn=prediction_collate_fn  # Use custom collate to handle PIL Images
         )
         
         print(f"\n  Testing DataLoader (batch_size={batch_size})...")
