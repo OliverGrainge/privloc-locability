@@ -1,0 +1,3 @@
+checkpoint,config,dataset_name,im2gps3k_FPR,im2gps3k_TPR,im2gps3k_accuracy,im2gps3k_auroc,im2gps3k_loss,im2gps3k_positive_rate,timestamp,yfcc4k_FPR,yfcc4k_TPR,yfcc4k_accuracy,yfcc4k_auroc,yfcc4k_loss,yfcc4k_positive_rate
+runs/binaryclassfier/megaloc/checkpoints/best_model.ckpt,runs/binaryclassfier/megaloc/config.yaml,yfcc4k,,,,,,,2025-11-25T06:19:52.640165,0.2568780779838562,0.6429100036621094,0.6819592118263245,0.7596746683120728,0.5954336524009705,0.6052747964859009
+runs/binaryclassfier/megaloc/checkpoints/best_model.ckpt,runs/binaryclassfier/megaloc/config.yaml,im2gps3k,0.5223965048789978,0.8205065727233887,0.7261424660682678,0.722499430179596,0.5572059154510498,0.7069892287254333,2025-11-25T06:20:44.034031,,,,,,
