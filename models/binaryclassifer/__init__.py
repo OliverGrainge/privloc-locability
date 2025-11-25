@@ -1,1 +1,1 @@
-from .model import BinaryErrorClassifier
+from .model import BinaryClassifier

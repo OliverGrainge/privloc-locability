@@ -1,0 +1,15 @@
+{"time":"2025-11-25T05:22:18.207184036Z","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"runs/binaryclassfier/test/logs/wandb/offline-run-20251125_052217-dtwl8nfz/logs/debug-core.log"}
+{"time":"2025-11-25T05:22:18.323116108Z","level":"WARN","msg":"GraphQL client is nil, skipping feature loading"}
+{"time":"2025-11-25T05:22:18.323514597Z","level":"INFO","msg":"created new stream","id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:18.324142212Z","level":"INFO","msg":"stream: started","id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:18.324165182Z","level":"INFO","msg":"writer: Do: started","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:18.32422988Z","level":"INFO","msg":"handler: started","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:18.324254878Z","level":"INFO","msg":"sender: started","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:18.329444083Z","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-11-25T05:22:40.353636453Z","level":"INFO","msg":"stream: closing","id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:40.353711196Z","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-11-25T05:22:40.353799616Z","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-11-25T05:22:40.35416923Z","level":"INFO","msg":"handler: closed","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:40.354194606Z","level":"INFO","msg":"writer: Close: closed","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:40.354294865Z","level":"INFO","msg":"sender: closed","stream_id":"dtwl8nfz"}
+{"time":"2025-11-25T05:22:40.354717448Z","level":"INFO","msg":"stream: closed","id":"dtwl8nfz"}

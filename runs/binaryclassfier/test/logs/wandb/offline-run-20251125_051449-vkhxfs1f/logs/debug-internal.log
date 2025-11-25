@@ -1,0 +1,15 @@
+{"time":"2025-11-25T05:14:49.860776453Z","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"runs/binaryclassfier/test/logs/wandb/offline-run-20251125_051449-vkhxfs1f/logs/debug-core.log"}
+{"time":"2025-11-25T05:14:49.981521297Z","level":"WARN","msg":"GraphQL client is nil, skipping feature loading"}
+{"time":"2025-11-25T05:14:49.982612681Z","level":"INFO","msg":"created new stream","id":"vkhxfs1f"}
+{"time":"2025-11-25T05:14:49.982659179Z","level":"INFO","msg":"stream: started","id":"vkhxfs1f"}
+{"time":"2025-11-25T05:14:49.982850388Z","level":"INFO","msg":"sender: started","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:14:49.98284205Z","level":"INFO","msg":"writer: Do: started","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:14:49.982871378Z","level":"INFO","msg":"handler: started","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:14:49.992135361Z","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-11-25T05:15:14.095876838Z","level":"INFO","msg":"stream: closing","id":"vkhxfs1f"}
+{"time":"2025-11-25T05:15:14.095962615Z","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-11-25T05:15:14.096134594Z","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-11-25T05:15:14.096638463Z","level":"INFO","msg":"handler: closed","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:15:14.096673163Z","level":"INFO","msg":"writer: Close: closed","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:15:14.096692507Z","level":"INFO","msg":"sender: closed","stream_id":"vkhxfs1f"}
+{"time":"2025-11-25T05:15:14.09720505Z","level":"INFO","msg":"stream: closed","id":"vkhxfs1f"}

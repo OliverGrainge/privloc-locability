@@ -13,18 +13,13 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional
+from torchmetrics.classification import BinaryAUROC, BinaryROC
 import logging
-import numpy as np
-from sklearn.metrics import precision_recall_curve, auc
-import matplotlib.pyplot as plt
-import io
 
 
 
 from .archs import load_arch_and_transform
-from data.datasets import load_prediction_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +38,8 @@ class BinaryClassifier(pl.LightningModule):
     def __init__(
         self,
         arch_name: str,
-        dataset_name: str,
-        pred_model_name: str,
         threshold_km: float = 2500.0,
         learning_rate: float = 1e-4,
-        batch_size: int = 32,
-        num_workers: int = 8,
         use_weighted_loss: bool = True,
         weight_positive: float = 1.0,
         use_focal_loss: bool = False,
@@ -60,12 +51,8 @@ class BinaryClassifier(pl.LightningModule):
         
         Args:
             arch_name: Name of the backbone architecture to load
-            dataset_name: Name of the dataset to load
-            pred_model_name: Name of the prediction model
             threshold_km: Distance threshold in kilometers (default: 2500)
             learning_rate: Learning rate for Adam optimizer
-            batch_size: Batch size for training
-            num_workers: Number of workers for data loading
             use_weighted_loss: Whether to use weighted BCE loss based on class distribution
             weight_positive: Manual weight for positive class (ignored if use_weighted_loss=True)
             use_focal_loss: Whether to use focal loss instead of BCE
@@ -93,14 +80,19 @@ class BinaryClassifier(pl.LightningModule):
         # For tracking class distribution (for running average of class weights)
         self.train_pos_count = 0
         self.train_neg_count = 0
-        self.val_pos_count = 0
-        self.val_neg_count = 0
         self.num_batches_seen = 0  # Track number of batches for running average
+
+        # For collecting test probabilities for distribution plot
+        self.test_probs_list = []
+
+        self._setup_metrics()
+
+    def _setup_metrics(self): 
+        self.val_auroc = BinaryAUROC()
+        self.test_auroc = BinaryAUROC()
+        self.val_roc = BinaryROC()   # will give you (fpr, tpr, thresholds)
+        self.test_roc = BinaryROC()
         
-        # For collecting test predictions for PR curve
-        self.test_predictions: List[torch.Tensor] = []
-        self.test_targets: List[torch.Tensor] = []
-        self.test_random_predictions: List[torch.Tensor] = []
 
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,14 +162,14 @@ class BinaryClassifier(pl.LightningModule):
     
     def compute_metrics(self, logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Compute evaluation metrics (accuracy, precision, recall, F1).
+        Compute evaluation metrics (accuracy, TPR, FPR).
         
         Args:
             logits: Predicted logits [batch_size]
             targets: Binary targets [batch_size]
             
         Returns:
-            Dictionary of metrics
+            Dictionary with accuracy, true_positive_rate, and false_positive_rate
         """
         probs = torch.sigmoid(logits)
         preds = (probs > 0.5).float()
@@ -191,37 +183,18 @@ class BinaryClassifier(pl.LightningModule):
         tn = ((preds == 0) & (targets == 0)).float().sum()
         fn = ((preds == 0) & (targets == 1)).float().sum()
         
-        # Random baseline: generate random predictions (50% positive, 50% negative)
-        random_preds = (torch.rand(targets.shape, device=targets.device) > 0.5).float()
+        # True Positive Rate (TPR) = Recall = TP / (TP + FN)
+        tpr = tp / (tp + fn + 1e-8)
         
-        # Random accuracy computed from random predictions
-        random_accuracy = (random_preds == targets).float().mean()
-        
-        # Random confusion matrix elements
-        random_tp = ((random_preds == 1) & (targets == 1)).float().sum()
-        random_fp = ((random_preds == 1) & (targets == 0)).float().sum()
-        random_fn = ((random_preds == 0) & (targets == 1)).float().sum()
-        
-        # Random precision, recall, F1
-        random_precision = random_tp / (random_tp + random_fp + 1e-8)
-        random_recall = random_tp / (random_tp + random_fn + 1e-8)
-        random_f1 = 2 * (random_precision * random_recall) / (random_precision + random_recall + 1e-8)
-        
-        # Precision, recall, F1
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+        # False Positive Rate (FPR) = FP / (FP + TN)
+        fpr = fp / (fp + tn + 1e-8)
         
         return {
             'accuracy': accuracy,
-            'random_accuracy': random_accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'random_precision': random_precision,
-            'random_recall': random_recall,
-            'random_f1': random_f1,
+            'TPR': tpr,
+            'FPR': fpr,
         }
+
     
     def _calculate_geodetic_error(self, lat1: torch.Tensor, lon1: torch.Tensor,
                                    lat2: torch.Tensor, lon2: torch.Tensor) -> torch.Tensor:
@@ -248,38 +221,6 @@ class BinaryClassifier(pl.LightningModule):
         
         return 6371.0 * c  # Earth's radius in km
     
-    def _log_class_distribution(self, targets: torch.Tensor, stage: str) -> None:
-        """
-        Log class distribution for monitoring class imbalance.
-        
-        Args:
-            targets: Binary targets
-            stage: 'train' or 'val'
-        """
-        num_positive = (targets == 1).sum().item()
-        num_negative = (targets == 0).sum().item()
-        total = len(targets)
-        
-        pos_ratio = 100.0 * num_positive / total if total > 0 else 0
-        neg_ratio = 100.0 * num_negative / total if total > 0 else 0
-        
-        logger.info(
-            f"{stage.upper()} Class Distribution - "
-            f"Positive: {num_positive} ({pos_ratio:.2f}%), "
-            f"Negative: {num_negative} ({neg_ratio:.2f}%), "
-            f"Total: {total}"
-        )
-        
-        self.log(f'{stage}/class_pos_ratio', pos_ratio / 100.0)
-        self.log(f'{stage}/class_neg_ratio', neg_ratio / 100.0)
-        
-        # Track cumulative counts
-        if stage == 'train':
-            self.train_pos_count += num_positive
-            self.train_neg_count += num_negative
-        else:
-            self.val_pos_count += num_positive
-            self.val_neg_count += num_negative
     
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -303,9 +244,6 @@ class BinaryClassifier(pl.LightningModule):
 
         # Create binary targets based on threshold
         targets = (error_km <= self.hparams.threshold_km).float()
-        
-        # Log class distribution and baselines (once per epoch)
-        self._log_class_distribution(targets, 'train')
     
         # Compute class weights using running average (more robust than first batch only)
         if self.use_weighted_loss and not self.use_focal_loss:
@@ -335,12 +273,14 @@ class BinaryClassifier(pl.LightningModule):
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
         metrics = self.compute_metrics(logits, targets)
+
         
         # Log metrics
         self.log('train/loss', loss, prog_bar=True)
         for key, value in metrics.items():
             self.log(f'train/{key}', value)
-        
+
+        self.log("train/positive_rate", targets.mean(), on_epoch=True)
         return loss
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -362,24 +302,26 @@ class BinaryClassifier(pl.LightningModule):
         # Create binary targets
         targets = (error_km <= self.hparams.threshold_km).float()
         
-        # Log class distribution and baselines (once per epoch)
-        self._log_class_distribution(targets, 'val')
-        
         # Forward pass
         logits = self(images)
+        probs = torch.sigmoid(logits)
         
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
         metrics = self.compute_metrics(logits, targets)
+
+        self.val_auroc.update(probs, targets.int())
+        self.val_roc.update(probs, targets.int())
         
         # Log metrics
         self.log('val/loss', loss, prog_bar=True)
         for key, value in metrics.items():
             self.log(f'val/{key}', value)
+        self.log("val/positive_rate", targets.mean(), on_epoch=True)
     
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         """
-        Test step with collection of predictions for PR curve.
+        Test step.
         
         Args:
             batch: Batch with keys: 'image', 'true_lat', 'true_lon', 'pred_lat', 'pred_lon'
@@ -396,258 +338,130 @@ class BinaryClassifier(pl.LightningModule):
         # Create binary targets
         targets = (error_km <= self.hparams.threshold_km).float()
         
-        # Log class distribution and baselines
-        self._log_class_distribution(targets, 'test')
-        
         # Forward pass
         logits = self(images)
+        probs = torch.sigmoid(logits)
+        
+        # Collect probabilities for distribution plot
+        self.test_probs_list.append(probs.detach().cpu())
         
         # Compute loss and metrics
         loss = self.compute_loss(logits, targets)
         metrics = self.compute_metrics(logits, targets)
+
+        self.test_auroc.update(probs, targets.int())
+        self.test_roc.update(probs, targets.int())
         
         # Log metrics
         self.log('test/loss', loss, prog_bar=True)
         for key, value in metrics.items():
             self.log(f'test/{key}', value)
+        self.log("test/positive_rate", targets.mean(), on_epoch=True)
+
+
+    def on_validation_epoch_end(self):
+        # AUROC scalar
+        val_auc = self.val_auroc.compute()
+        self.log("val/auroc", val_auc, prog_bar=True)
+
+        # ROC curve points
+        fpr, tpr, thresholds = self.val_roc.compute()
+
+        # If using TensorBoard
+        if isinstance(self.logger, pl.loggers.TensorBoardLogger):
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots()
+            ax.plot(fpr.cpu(), tpr.cpu())
+            ax.set_xlabel("False Positive Rate")
+            ax.set_ylabel("True Positive Rate")
+            ax.set_title(f"ROC (AUC = {val_auc:.3f})")
+
+            if self.trainer is not None and self.trainer.is_global_zero:
+                self.trainer.val_roc_figure = fig  
+
+            self.logger.experiment.add_figure(
+                "val/roc_curve",
+                fig,
+                global_step=self.current_epoch,
+            )
+            plt.close(fig)
+
+        # reset for next epoch
+        self.val_auroc.reset()
+        self.val_roc.reset()
+
+
+    def on_test_epoch_end(self):
+        test_auc = self.test_auroc.compute()
+        self.log("test/auroc", test_auc, prog_bar=True)
+
+        fpr, tpr, thresholds = self.test_roc.compute()
+
+        # Create ROC curve figure regardless of logger type
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        ax.plot(fpr.cpu(), tpr.cpu())
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(f"Test ROC (AUC = {test_auc:.3f})")
+
+        # Attach figure to trainer so test.py can collect and save it
+        if self.trainer is not None and self.trainer.is_global_zero:
+            self.trainer.test_roc_figure = fig  
+
+        # Log to logger if it supports figures
+        if self.logger is not None:
+            if isinstance(self.logger, pl.loggers.TensorBoardLogger):
+                self.logger.experiment.add_figure(
+                    "test/roc_curve",
+                    fig,
+                    global_step=self.current_epoch,
+                )
+            elif hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'log'):
+                # For WandB and other loggers that support logging figures
+                try:
+                    import wandb
+                    if isinstance(self.logger.experiment, wandb.sdk.wandb_run.Run):
+                        self.logger.experiment.log({
+                            "test/roc_curve": wandb.Image(fig)
+                        })
+                except (ImportError, AttributeError):
+                    pass
         
-        # Store predictions and targets for PR curve
-        probs = torch.sigmoid(logits)
-        self.test_predictions.append(probs.detach().cpu())
-        self.test_targets.append(targets.detach().cpu())
-        
-        # Store random predictions for baseline PR curve
-        random_probs = torch.rand(targets.shape, device=targets.device)
-        self.test_random_predictions.append(random_probs.detach().cpu())
+        # Don't close the figure here - let test.py collect and save it
+
+        # Create probability distribution histogram
+        if len(self.test_probs_list) > 0:
+            all_probs = torch.cat(self.test_probs_list, dim=0).numpy()
+            
+            fig_dist, ax_dist = plt.subplots(figsize=(8, 6))
+            ax_dist.hist(all_probs, bins=50, edgecolor='black', alpha=0.7)
+            ax_dist.set_xlabel("Predicted Probability")
+            ax_dist.set_ylabel("Frequency")
+            ax_dist.set_title("Distribution of Test Predictions")
+            ax_dist.set_xlim(0, 1)
+            ax_dist.grid(True, alpha=0.3)
+            
+            # Add statistics text
+            mean_prob = all_probs.mean()
+            std_prob = all_probs.std()
+            min_prob = all_probs.min()
+            max_prob = all_probs.max()
+            stats_text = f"Mean: {mean_prob:.4f}\nStd: {std_prob:.4f}\nMin: {min_prob:.4f}\nMax: {max_prob:.4f}"
+            ax_dist.text(0.7, 0.95, stats_text, transform=ax_dist.transAxes,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            if self.trainer is not None and self.trainer.is_global_zero:
+                self.trainer.test_prob_dist_figure = fig_dist
+
+        self.test_auroc.reset()
+        self.test_roc.reset()
+        self.test_probs_list.clear()
     
-    def on_test_epoch_end(self) -> None:
-        """
-        Compute and log PR curve and AUPRC at the end of test epoch.
-        """
-        if len(self.test_predictions) == 0:
-            logger.warning("No test predictions collected for PR curve")
-            return
-        
-        # Concatenate all predictions and targets
-        all_probs = torch.cat(self.test_predictions, dim=0).float().numpy()
-        all_targets = torch.cat(self.test_targets, dim=0).float().numpy()
-        all_random_probs = torch.cat(self.test_random_predictions, dim=0).float().numpy()
-        
-        # Compute precision-recall curve for model predictions
-        precision, recall, thresholds = precision_recall_curve(all_targets, all_probs)
-        auprc = auc(recall, precision)
-        
-        # Compute precision-recall curve for random predictions
-        random_precision, random_recall, random_thresholds = precision_recall_curve(all_targets, all_random_probs)
-        random_auprc = auc(random_recall, random_precision)
-        
-        # Compute recall at specific precision thresholds
-        def recall_at_precision(precision_array, recall_array, target_precision):
-            """Find maximum recall where precision >= target_precision."""
-            # Find indices where precision meets or exceeds target
-            valid_indices = precision_array >= target_precision
-            if valid_indices.any():
-                return recall_array[valid_indices].max()
-            return 0.0
-        
-        # Compute precision at specific recall thresholds
-        def precision_at_recall(precision_array, recall_array, target_recall):
-            """Find maximum precision where recall >= target_recall."""
-            # Find indices where recall meets or exceeds target
-            valid_indices = recall_array >= target_recall
-            if valid_indices.any():
-                return precision_array[valid_indices].max()
-            return 0.0
-        
-        recall_at_100_precision = recall_at_precision(precision, recall, 1.0)
-        recall_at_95_precision = recall_at_precision(precision, recall, 0.95)
-        recall_at_90_precision = recall_at_precision(precision, recall, 0.90)
-        recall_at_80_precision = recall_at_precision(precision, recall, 0.80)
-        
-        precision_at_100_recall = precision_at_recall(precision, recall, 1.0)
-        precision_at_95_recall = precision_at_recall(precision, recall, 0.95)
-        precision_at_90_recall = precision_at_recall(precision, recall, 0.90)
-        precision_at_80_recall = precision_at_recall(precision, recall, 0.80)
-        
-        # Compute recall at precision for random predictions
-        random_recall_at_100_precision = recall_at_precision(random_precision, random_recall, 1.0)
-        random_recall_at_95_precision = recall_at_precision(random_precision, random_recall, 0.95)
-        random_recall_at_90_precision = recall_at_precision(random_precision, random_recall, 0.90)
-        random_recall_at_80_precision = recall_at_precision(random_precision, random_recall, 0.80)
-        
-        # Compute precision at recall for random predictions
-        random_precision_at_100_recall = precision_at_recall(random_precision, random_recall, 1.0)
-        random_precision_at_95_recall = precision_at_recall(random_precision, random_recall, 0.95)
-        random_precision_at_90_recall = precision_at_recall(random_precision, random_recall, 0.90)
-        random_precision_at_80_recall = precision_at_recall(random_precision, random_recall, 0.80)
-        
-        # Log AUPRCs
-        self.log('test/auprc', auprc, prog_bar=True)
-        self.log('test/random_auprc', random_auprc, prog_bar=True)
-        
-        # Log recall at precision thresholds
-        self.log('test/recall_at_100_precision', recall_at_100_precision, prog_bar=True)
-        self.log('test/recall_at_95_precision', recall_at_95_precision, prog_bar=True)
-        self.log('test/recall_at_90_precision', recall_at_90_precision, prog_bar=True)
-        self.log('test/recall_at_80_precision', recall_at_80_precision, prog_bar=True)
-        
-        # Log precision at recall thresholds
-        self.log('test/precision_at_100_recall', precision_at_100_recall, prog_bar=True)
-        self.log('test/precision_at_95_recall', precision_at_95_recall, prog_bar=True)
-        self.log('test/precision_at_90_recall', precision_at_90_recall, prog_bar=True)
-        self.log('test/precision_at_80_recall', precision_at_80_recall, prog_bar=True)
-        
-        # Log random recall at precision thresholds
-        self.log('test/random_recall_at_100_precision', random_recall_at_100_precision, prog_bar=True)
-        self.log('test/random_recall_at_95_precision', random_recall_at_95_precision, prog_bar=True)
-        self.log('test/random_recall_at_90_precision', random_recall_at_90_precision, prog_bar=True)
-        self.log('test/random_recall_at_80_precision', random_recall_at_80_precision, prog_bar=True)
-        
-        # Log random precision at recall thresholds
-        self.log('test/random_precision_at_100_recall', random_precision_at_100_recall, prog_bar=True)
-        self.log('test/random_precision_at_95_recall', random_precision_at_95_recall, prog_bar=True)
-        self.log('test/random_precision_at_90_recall', random_precision_at_90_recall, prog_bar=True)
-        self.log('test/random_precision_at_80_recall', random_precision_at_80_recall, prog_bar=True)
-        
-        logger.info(f"Test AUPRC: {auprc:.4f}, Random AUPRC: {random_auprc:.4f}")
-        logger.info(f"Recall@Precision - 100%: {recall_at_100_precision:.4f}, "
-                   f"95%: {recall_at_95_precision:.4f}, "
-                   f"90%: {recall_at_90_precision:.4f}, "
-                   f"80%: {recall_at_80_precision:.4f}")
-        
-        # Create combined PR curve plot (model + random baseline)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.plot(recall, precision, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
-        ax.plot(random_recall, random_precision, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
-                color='red', linestyle='--', alpha=0.7)
-        ax.set_xlabel('Recall', fontsize=12)
-        ax.set_ylabel('Precision', fontsize=12)
-        ax.set_title('Precision-Recall Curve', fontsize=14)
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim([0.0, 1.0])
-        ax.set_ylim([0.0, 1.05])
-        
-        # Log PR curve figure to WandB
-        plt.tight_layout()
-        if self.logger is not None and hasattr(self.logger, 'experiment'):
-            try:
-                import wandb
-                self.logger.experiment.log({
-                    "test/pr_curve": wandb.Image(fig)
-                })
-                logger.info("PR curve logged to WandB")
-            except Exception as e:
-                logger.warning(f"Failed to log PR curve to WandB: {e}")
-        else:
-            logger.warning("WandB logger not available, skipping PR curve logging")
-        
-        plt.close(fig)
-        
-        # Create combined RP curve plot (model + random baseline, swapped axes)
-        # Note: The area under the curve is the same as AUPRC (just with axes swapped for visualization)
-        fig_rp, ax_rp = plt.subplots(figsize=(8, 6))
-        ax_rp.plot(precision, recall, linewidth=2, label=f'Model (AUPRC = {auprc:.4f})', color='blue')
-        ax_rp.plot(random_precision, random_recall, linewidth=2, label=f'Random (AUPRC = {random_auprc:.4f})', 
-                   color='red', linestyle='--', alpha=0.7)
-        ax_rp.set_xlabel('Precision', fontsize=12)
-        ax_rp.set_ylabel('Recall', fontsize=12)
-        ax_rp.set_title('Recall-Precision Curve', fontsize=14)
-        ax_rp.legend(loc='best', fontsize=10)
-        ax_rp.grid(True, alpha=0.3)
-        ax_rp.set_xlim([0.0, 1.0])
-        ax_rp.set_ylim([0.0, 1.05])
-        
-        # Log RP curve figure to WandB
-        plt.tight_layout()
-        if self.logger is not None and hasattr(self.logger, 'experiment'):
-            try:
-                import wandb
-                self.logger.experiment.log({
-                    "test/rp_curve": wandb.Image(fig_rp)
-                })
-                logger.info("RP curve logged to WandB")
-            except Exception as e:
-                logger.warning(f"Failed to log RP curve to WandB: {e}")
-        else:
-            logger.warning("WandB logger not available, skipping RP curve logging")
-        
-        plt.close(fig_rp)
-        
-        # Clear stored predictions and targets
-        self.test_predictions.clear()
-        self.test_targets.clear()
-        self.test_random_predictions.clear()
     
     def configure_optimizers(self):
         """Configure optimizer with cosine annealing scheduler."""
         optimizer = Adam(self.parameters(), lr=self.hparams.learning_rate)
         return optimizer
-    
-    def train_dataloader(self) -> DataLoader:
-        """Create training dataloader."""
-        dataset = load_prediction_dataset(
-            dataset_name=self.hparams.dataset_name,
-            model_name=self.hparams.pred_model_name,
-            transform=self.transform,
-            split="train",
-        )
-        
-        # Only drop last if dataset is large enough to have at least one full batch
-        drop_last = len(dataset) > self.hparams.batch_size
-        
-        return DataLoader(
-            dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=False,
-            num_workers=self.hparams.num_workers,
-            pin_memory=True,
-            drop_last=drop_last,
-        )
-
-
-    def val_dataloader(self) -> DataLoader:
-        """Create validation dataloader."""
-        dataset = load_prediction_dataset(
-            dataset_name=self.hparams.dataset_name,
-            model_name=self.hparams.pred_model_name,
-            transform=self.transform,
-            split="val",
-        )
-        
-        # Only drop last if dataset is large enough to have at least one full batch
-        drop_last = len(dataset) > self.hparams.batch_size
-        
-        return DataLoader(
-            dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=False,
-            num_workers=self.hparams.num_workers,
-            pin_memory=True,
-            drop_last=drop_last,
-        )
-
-
-    def test_dataloader(self) -> DataLoader:
-        """Create test dataloader."""
-        # For mp16, use "val" split for testing
-        # For yfcc4k and im2gps3k, these are test-only datasets, so no split needed
-        split = "val" if self.hparams.dataset_name == "mp16" else None
-        dataset = load_prediction_dataset(
-            dataset_name=self.hparams.dataset_name,
-            model_name=self.hparams.pred_model_name,
-            transform=self.transform,
-            split=split,
-        )
-        
-        # Only drop last if dataset is large enough to have at least one full batch
-        drop_last = len(dataset) > self.hparams.batch_size
-        
-        return DataLoader(
-            dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=False,
-            num_workers=self.hparams.num_workers,
-            pin_memory=True,
-            drop_last=drop_last,
-        )
