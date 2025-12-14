@@ -4,3 +4,4 @@
 wandb/
 checkpoints/
 *.png 
+logs/
