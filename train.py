@@ -92,9 +92,13 @@ def setup_logger(config: Dict[str, Any], config_dir: Path, config_name: str) -> 
     logs_dir = config_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     
+    # Use the two parent directory names: e.g., runs/binaryclassfier/test/test.yaml -> binaryclassfier-test
+    parent_dirs = config_dir.parts[-2:]  # Get last two directory names
+    run_name = "-".join(parent_dirs)
+    
     logger = WandbLogger(
         project="GeoErrorBinaryClassifier",
-        name=f"{config_name}_training",
+        name=run_name,
         save_dir=str(logs_dir),
         log_model=False
     )

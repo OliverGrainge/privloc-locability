@@ -1,3 +1,0 @@
-checkpoint,config,dataset_name,im2gps3k_FPR,im2gps3k_TPR,im2gps3k_accuracy,im2gps3k_auroc,im2gps3k_loss,im2gps3k_positive_rate,timestamp,yfcc4k_FPR,yfcc4k_TPR,yfcc4k_accuracy,yfcc4k_auroc,yfcc4k_loss,yfcc4k_positive_rate
-runs/conditionalvae/test/checkpoints/best_model.ckpt,runs/conditionalvae/test/test.yaml,yfcc4k,,,,,,,2025-11-25T06:53:22.172482,1.0,1.0,0.6031249761581421,0.5,98.22288513183594,0.6031249761581421
-runs/conditionalvae/test/checkpoints/best_model.ckpt,runs/conditionalvae/test/test.yaml,im2gps3k,1.0,1.0,0.6796875,0.5,78.67424774169922,0.6796875,2025-11-25T06:53:26.058329,,,,,,

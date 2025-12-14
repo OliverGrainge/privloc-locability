@@ -1,34 +1,20 @@
-"""
-Conditional VAE-based binary classifier for geolocation error prediction.
-
-Uses a single conditional VAE that models p(x|y) where y is the binary 
-localizability label. More efficient and elegant than dual VAE approach.
-
-Key idea: Train one model conditioned on the class label, then use the 
-conditional likelihoods p(x|y=1) and p(x|y=0) for classification.
-"""
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import os
 import pytorch_lightning as pl
 from torch.optim import Adam
-from typing import Dict, Tuple
 from torchmetrics.classification import BinaryAUROC, BinaryROC
-import logging
+from typing import Dict, Tuple
+
+import torch.nn.functional as F
+from diffusers import AutoencoderKL
+import torch
+import torch.nn as nn
 
 from .arch import build_encoder
 
-logger = logging.getLogger(__name__)
 
-
-class ConditionalVAE(nn.Module):
+class ConditionalVAEWithPretrainedDecoder(nn.Module):
     """
-    Conditional VAE that models p(x|y) where y is binary class label.
-    
-    Architecture:
-    - Encoder: x → z (shared across classes)
-    - Decoder: [z, y] → x (conditioned on class label)
+    Conditional VAE using Stable Diffusion's pretrained VAE.
     """
     
     def __init__(
@@ -39,18 +25,9 @@ class ConditionalVAE(nn.Module):
         img_size: int = 224,
         img_channels: int = 3,
         num_classes: int = 2,
+        vae_model: str = "stabilityai/sd-vae-ft-mse",
+        freeze_vae_decoder: bool = True,
     ):
-        """
-        Initialize conditional VAE.
-        
-        Args:
-            encoder: Pretrained encoder (from timm)
-            encoder_out_dim: Output dimension of encoder
-            latent_dim: Latent space dimension
-            img_size: Image size
-            img_channels: Number of image channels
-            num_classes: Number of classes (2 for binary)
-        """
         super().__init__()
         
         self.encoder = encoder
@@ -59,117 +36,88 @@ class ConditionalVAE(nn.Module):
         self.img_channels = img_channels
         self.num_classes = num_classes
         
-        # Encoder to latent distribution (shared)
+        # Load pretrained VAE from Stable Diffusion
+        # Use local_files_only=True to avoid network requests when model is cached
+        # Use cache_dir from environment variables if set
+        cache_dir = os.getenv("HF_HOME") or os.getenv("HUGGINGFACE_HUB_CACHE")
+        self.pretrained_vae = AutoencoderKL.from_pretrained(
+            vae_model, 
+            local_files_only=True,
+            cache_dir=cache_dir
+        )
+        
+        # Freeze VAE decoder if requested
+        if freeze_vae_decoder:
+            for param in self.pretrained_vae.decoder.parameters():
+                param.requires_grad = False
+            for param in self.pretrained_vae.post_quant_conv.parameters():
+                param.requires_grad = False
+        
+        # Encoder to latent distribution
         self.fc_mu = nn.Linear(encoder_out_dim, latent_dim)
         self.fc_logvar = nn.Linear(encoder_out_dim, latent_dim)
         
-        # Conditional decoder
-        # Input: [z, y_embedding]
+        # Conditional embedding
         self.class_embedding = nn.Embedding(num_classes, latent_dim)
         
-        # Decoder architecture
-        self.init_size = img_size // 32  # 7 for 224
-        self.init_channels = 512
+        # Map our latent space to SD VAE's latent space
+        # SD VAE expects [B, 4, H/8, W/8] for 224x224 → [B, 4, 28, 28]
+        sd_latent_spatial = img_size // 8
+        sd_latent_channels = 4
         
-        # Project [z + class_embedding] to initial feature map
-        self.fc_decode = nn.Linear(latent_dim * 2, self.init_channels * self.init_size ** 2)
-        
-        # Transposed convolutions
-        self.decoder = nn.Sequential(
-            # 7x7 -> 14x14
-            nn.ConvTranspose2d(self.init_channels, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            # 14x14 -> 28x28
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            # 28x28 -> 56x56
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            # 56x56 -> 112x112
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            # 112x112 -> 224x224
-            nn.ConvTranspose2d(32, img_channels, 4, 2, 1),
-            nn.Sigmoid()
+        self.latent_adapter = nn.Sequential(
+            nn.Linear(latent_dim * 2, 512),  # latent + class embedding
+            nn.ReLU(),
+            nn.Linear(512, sd_latent_channels * sd_latent_spatial * sd_latent_spatial),
         )
-
+        
+        self.sd_latent_spatial = sd_latent_spatial
+        self.sd_latent_channels = sd_latent_channels
+        
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
     
-    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode image to latent distribution.
-        
-        Args:
-            x: Images [B, C, H, W]
-            
-        Returns:
-            mu, logvar: Latent distribution parameters [B, latent_dim]
-        """
+    def encode(self, x: torch.Tensor):
+        """Encode using your custom encoder."""
         h = self.encoder(x)
-        
-        # Flatten if needed
         if len(h.shape) == 4:
             h = h.flatten(start_dim=1)
         
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
-        
         return mu, logvar
     
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick."""
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def decode(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        Decode latent vector conditioned on class label.
-        
-        Args:
-            z: Latent vectors [B, latent_dim]
-            y: Class labels [B] (0 or 1)
-            
-        Returns:
-            Reconstructed images [B, C, H, W]
-        """
+    def decode(self, z: torch.Tensor, y: torch.Tensor):
+        """Decode using pretrained SD VAE."""
         # Get class embedding
-        y_embed = self.class_embedding(y)  # [B, latent_dim]
+        y_embed = self.class_embedding(y)
         
         # Concatenate z and class embedding
-        z_cond = torch.cat([z, y_embed], dim=1)  # [B, latent_dim * 2]
+        z_cond = torch.cat([z, y_embed], dim=1)
         
-        # Project to feature map
-        h = self.fc_decode(z_cond)
-        h = h.view(-1, self.init_channels, self.init_size, self.init_size)
+        # Map to SD VAE latent space
+        sd_latent = self.latent_adapter(z_cond)
+        sd_latent = sd_latent.view(
+            -1, 
+            self.sd_latent_channels, 
+            self.sd_latent_spatial, 
+            self.sd_latent_spatial
+        )
         
-        # Decode
-        return self.decoder(h)
+        # Decode using pretrained VAE decoder
+        recon = self.pretrained_vae.decode(sd_latent).sample
+        
+        # Ensure output is in [0, 1] range
+        recon = torch.clamp(recon, 0, 1)
+        
+        return recon
     
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        y: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full forward pass.
-        
-        Args:
-            x: Images [B, C, H, W]
-            y: Class labels [B]
-            
-        Returns:
-            recon: Reconstructed images [B, C, H, W]
-            mu: Latent means [B, latent_dim]
-            logvar: Latent log variances [B, latent_dim]
-        """
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z, y)
@@ -177,12 +125,7 @@ class ConditionalVAE(nn.Module):
 
 
 class ConditionalVAEClassifier(pl.LightningModule):
-    """
-    Binary classifier using conditional VAE.
-    
-    Training: Learn p(x|y) via CVAE
-    Inference: Classify using p(x|y=1) vs p(x|y=0) (via ELBO)
-    """
+    """Updated to use pretrained VAE."""
     
     def __init__(
         self,
@@ -195,21 +138,9 @@ class ConditionalVAEClassifier(pl.LightningModule):
         img_channels: int = 3,
         pretrained: bool = True,
         freeze_encoder: bool = False,
+        vae_model: str = "stabilityai/sd-vae-ft-mse",  # NEW
+        freeze_vae_decoder: bool = True,  # NEW
     ):
-        """
-        Initialize conditional VAE classifier.
-        
-        Args:
-            encoder_name: Name of timm backbone to load
-            latent_dim: Latent space dimension
-            threshold_km: Distance threshold for binary classification
-            learning_rate: Learning rate
-            beta: Beta parameter for VAE (KL weight)
-            img_size: Input image size
-            img_channels: Number of image channels
-            pretrained: Whether to load pretrained timm weights
-            freeze_encoder: Whether to freeze encoder weights
-        """
         super().__init__()
         self.save_hyperparameters()
 
@@ -224,19 +155,19 @@ class ConditionalVAEClassifier(pl.LightningModule):
             for param in encoder.parameters():
                 param.requires_grad = False
         
-        # Conditional VAE
-        self.cvae = ConditionalVAE(
+        # Use new conditional VAE with pretrained decoder
+        self.cvae = ConditionalVAEWithPretrainedDecoder(
             encoder=encoder,
             encoder_out_dim=encoder_out_dim,
             latent_dim=latent_dim,
             img_size=img_size,
             img_channels=img_channels,
             num_classes=2,
+            vae_model=vae_model,
+            freeze_vae_decoder=freeze_vae_decoder,
         )
         
         self.beta = beta
-        
-        # Metrics
         self._setup_metrics()
         
         # For test visualization
@@ -254,29 +185,29 @@ class ConditionalVAEClassifier(pl.LightningModule):
         self.test_roc = BinaryROC()
     
     def compute_elbo(
-    self, 
-    x: torch.Tensor, 
-    y: torch.Tensor
+        self, 
+        x: torch.Tensor, 
+        y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute ELBO for given images and labels.
-
-        Returns per-sample *mean* reconstruction and KL, so ELBO scale stays sane.
+        
+        Returns per-sample ELBO, reconstruction loss, and KL loss.
         """
         # Forward pass
         recon, mu, logvar = self.cvae(x, y)
-
-        # Reconstruction loss: per-sample MEAN over all pixels/channels
+        
+        # Compute reconstruction loss in pixel space
         recon_loss = F.mse_loss(recon, x, reduction='none')
         recon_loss = recon_loss.view(x.size(0), -1).mean(dim=1)  # [B]
-
-        # KL divergence: per-sample MEAN over latent dims
+        
+        # KL divergence: per-sample mean over latent dims
         kl_element = 1 + logvar - mu.pow(2) - logvar.exp()
         kl_loss = -0.5 * kl_element.mean(dim=1)  # [B]
-
-        # ELBO (we’ll still treat this as "log-likelihood-ish")
+        
+        # ELBO (negative loss is log-likelihood)
         elbo = -(recon_loss + self.beta * kl_loss)  # [B]
-
+        
         return elbo, recon_loss, kl_loss
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -302,8 +233,6 @@ class ConditionalVAEClassifier(pl.LightningModule):
         elbo_0, _, _ = self.compute_elbo(x, y_0)
         
         # Log-likelihood ratio as logits
-        # log p(y=1|x) - log p(y=0|x) ≈ log p(x|y=1) - log p(x|y=0)
-        #                               ≈ ELBO_1 - ELBO_0
         logits = elbo_1 - elbo_0
         logits = self.logit_scale * logits + self.logit_bias
         return logits
@@ -476,24 +405,23 @@ class ConditionalVAEClassifier(pl.LightningModule):
         
         fpr, tpr, thresholds = self.val_roc.compute()
         
-        if isinstance(self.logger, pl.loggers.TensorBoardLogger):
-            import matplotlib.pyplot as plt
-            
-            fig, ax = plt.subplots()
-            ax.plot(fpr.cpu(), tpr.cpu())
-            ax.set_xlabel("False Positive Rate")
-            ax.set_ylabel("True Positive Rate")
-            ax.set_title(f"ROC (AUC = {val_auc:.3f})")
-            
-            if self.trainer is not None and self.trainer.is_global_zero:
-                self.trainer.val_roc_figure = fig
-            
-            self.logger.experiment.add_figure(
-                "val/roc_curve",
-                fig,
-                global_step=self.current_epoch,
-            )
-            plt.close(fig)
+        # Log to WandB
+        import matplotlib.pyplot as plt
+        import wandb
+        
+        fig, ax = plt.subplots()
+        ax.plot(fpr.cpu(), tpr.cpu())
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(f"ROC (AUC = {val_auc:.3f})")
+        
+        if self.trainer is not None and self.trainer.is_global_zero:
+            self.trainer.val_roc_figure = fig
+        
+        self.logger.experiment.log({
+            "val/roc_curve": wandb.Image(fig)
+        })
+        plt.close(fig)
         
         self.val_auroc.reset()
         self.val_roc.reset()
@@ -505,7 +433,9 @@ class ConditionalVAEClassifier(pl.LightningModule):
         
         fpr, tpr, thresholds = self.test_roc.compute()
         
+        # Log to WandB
         import matplotlib.pyplot as plt
+        import wandb
         
         # ROC curve
         fig_roc, ax_roc = plt.subplots()
@@ -517,12 +447,11 @@ class ConditionalVAEClassifier(pl.LightningModule):
         if self.trainer is not None and self.trainer.is_global_zero:
             self.trainer.test_roc_figure = fig_roc
         
-        if self.logger is not None and isinstance(self.logger, pl.loggers.TensorBoardLogger):
-            self.logger.experiment.add_figure(
-                "test/roc_curve",
-                fig_roc,
-                global_step=self.current_epoch,
-            )
+        self.logger.experiment.log({
+            "test/roc_curve": wandb.Image(fig_roc)
+        })
+        
+        # Don't close the figure here - let test.py collect and save it
         
         # Probability distribution
         if len(self.test_probs_list) > 0:

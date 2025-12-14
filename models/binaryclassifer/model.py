@@ -367,25 +367,23 @@ class BinaryClassifier(pl.LightningModule):
         # ROC curve points
         fpr, tpr, thresholds = self.val_roc.compute()
 
-        # If using TensorBoard
-        if isinstance(self.logger, pl.loggers.TensorBoardLogger):
-            import matplotlib.pyplot as plt
+        # Log to WandB
+        import matplotlib.pyplot as plt
+        import wandb
 
-            fig, ax = plt.subplots()
-            ax.plot(fpr.cpu(), tpr.cpu())
-            ax.set_xlabel("False Positive Rate")
-            ax.set_ylabel("True Positive Rate")
-            ax.set_title(f"ROC (AUC = {val_auc:.3f})")
+        fig, ax = plt.subplots()
+        ax.plot(fpr.cpu(), tpr.cpu())
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(f"ROC (AUC = {val_auc:.3f})")
 
-            if self.trainer is not None and self.trainer.is_global_zero:
-                self.trainer.val_roc_figure = fig  
+        if self.trainer is not None and self.trainer.is_global_zero:
+            self.trainer.val_roc_figure = fig  
 
-            self.logger.experiment.add_figure(
-                "val/roc_curve",
-                fig,
-                global_step=self.current_epoch,
-            )
-            plt.close(fig)
+        self.logger.experiment.log({
+            "val/roc_curve": wandb.Image(fig)
+        })
+        plt.close(fig)
 
         # reset for next epoch
         self.val_auroc.reset()
@@ -398,8 +396,9 @@ class BinaryClassifier(pl.LightningModule):
 
         fpr, tpr, thresholds = self.test_roc.compute()
 
-        # Create ROC curve figure regardless of logger type
+        # Log to WandB
         import matplotlib.pyplot as plt
+        import wandb
 
         fig, ax = plt.subplots()
         ax.plot(fpr.cpu(), tpr.cpu())
@@ -411,24 +410,9 @@ class BinaryClassifier(pl.LightningModule):
         if self.trainer is not None and self.trainer.is_global_zero:
             self.trainer.test_roc_figure = fig  
 
-        # Log to logger if it supports figures
-        if self.logger is not None:
-            if isinstance(self.logger, pl.loggers.TensorBoardLogger):
-                self.logger.experiment.add_figure(
-                    "test/roc_curve",
-                    fig,
-                    global_step=self.current_epoch,
-                )
-            elif hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'log'):
-                # For WandB and other loggers that support logging figures
-                try:
-                    import wandb
-                    if isinstance(self.logger.experiment, wandb.sdk.wandb_run.Run):
-                        self.logger.experiment.log({
-                            "test/roc_curve": wandb.Image(fig)
-                        })
-                except (ImportError, AttributeError):
-                    pass
+        self.logger.experiment.log({
+            "test/roc_curve": wandb.Image(fig)
+        })
         
         # Don't close the figure here - let test.py collect and save it
 

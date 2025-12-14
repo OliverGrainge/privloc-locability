@@ -74,7 +74,7 @@ class PredictionBaseDataset(Dataset):
         self.total_samples = 0
         
         # Prefetching state
-        self.prefetch_next = True
+        self.prefetch_next = False  # Disable to save memory
         self.next_file_df = None
         self.next_file_idx = None
         
@@ -363,6 +363,7 @@ class Mp16PredictionDataset(PredictionBaseDataset):
         # Find all parquet files in the directory
         parquet_path = Path(parquet_files)
         all_parquet_files = sorted(parquet_path.glob("part_*.parquet"))
+        #all_parquet_files = all_parquet_files[:10]
         
         if not all_parquet_files:
             raise FileNotFoundError(f"No parquet files found in directory: {parquet_path}")
@@ -372,8 +373,7 @@ class Mp16PredictionDataset(PredictionBaseDataset):
             raise ValueError(f"Split must be 'train', 'val', or 'test', got '{split}'")
         
         total_shards = len(all_parquet_files)
-        split_point = total_shards // 2
-        
+        split_point = int(total_shards * 0.8)
         if split == 'train':
             selected_parquet_files = all_parquet_files[:split_point]
             print(f"Using {len(selected_parquet_files)}/{total_shards} shards for training (50% split)")

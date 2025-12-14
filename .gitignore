@@ -1,0 +1,6 @@
+*.ckpt 
+*.json 
+*.pyc
+wandb/
+checkpoints/
+*.png 
