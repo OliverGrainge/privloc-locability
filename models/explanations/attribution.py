@@ -1,11 +1,14 @@
 """
-Gradient-based attribution for geoprivacy risk prediction.
+Attribution methods for geoprivacy risk prediction.
 
-Implements gradient × input attribution to identify which image regions
-most affect the model's geolocation risk score.
+Implements multiple attribution methods:
+- Gradient × input attribution
+- Integrated gradients
+- Attention rollout (for Vision Transformers like DINOv2)
+- Raw gradients
 """
 
-from typing import Optional, Union, List, Tuple
+from typing import Optional, Union, List, Tuple, Dict
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -13,230 +16,192 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torchvision.transforms.functional import gaussian_blur
 import PIL
+import numpy as np
+from models.binaryclassifer import BinaryClassifier
 
 
 class GeoAttributionHeatmap: 
-    """
-    Generate gradient-based attribution heatmaps for geoprivacy risk.
-    
-    This class computes ∂(risk_score)/∂(image) to identify which spatial
-    regions most affect whether an image is localizable.
-    
-    Args:
-        model: Trained BinaryClassifier model (PyTorch Lightning module)
-        transform: Image preprocessing transform (should match model's transform)
-        device: Device to run computation on ('cpu', 'cuda', etc.)
-        smooth_heatmap: Whether to apply Gaussian smoothing to reduce noise
-        smooth_kernel_size: Kernel size for Gaussian smoothing (must be odd)
-    """
-    
-    def __init__(
-        self, 
-        model: pl.LightningModule, 
-        transform: transforms.Compose, 
-        device: Optional[str] = "cpu",
-        smooth_heatmap: bool = True,
-        smooth_kernel_size: int = 15
-    ):
-        self.model = model.to(device)
-        self.model.eval()  # Set to evaluation mode
+    def __init__(self, model: BinaryClassifier, transform: transforms.Compose):
+        self.model = model
         self.transform = transform
-        self.device = device
-        self.smooth_heatmap = smooth_heatmap
-        self.smooth_kernel_size = smooth_kernel_size
+        self.device = self._get_device()
+        self.model.to(self.device)
+        self.model.eval()
+
+    def _get_device(self) -> str:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def __call__(self, image: Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]], 
+                 head_fusion: str = "mean", discard_ratio: float = 0.1) -> torch.Tensor:
+        """
+        Compute attention rollout saliency map.
         
-        # Ensure kernel size is odd
-        if self.smooth_kernel_size % 2 == 0:
-            self.smooth_kernel_size += 1
+        Args:
+            image: Input image(s) to compute attribution for
+            head_fusion: How to combine attention heads ('mean', 'max', or 'min')
+            discard_ratio: Ratio of lowest attentions to discard for stability
+            
+        Returns:
+            Saliency map of shape [batch_size, height, width] or [height, width] if single image
+        """
+        image = self._preprocess_image(image)
+        image = image.to(self.device)
+        
+        # Get attention maps from all layers
+        attention_maps = self._extract_attention_maps(image)
+        
+        # Compute attention rollout
+        rollout = self._compute_attention_rollout(attention_maps, head_fusion, discard_ratio)
+        
+        # Convert to spatial saliency map
+        saliency = self._rollout_to_saliency(rollout, image.shape[-2:])
+        
+        return saliency.squeeze() if saliency.shape[0] == 1 else saliency
 
     def _preprocess_image(self, image: Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]]) -> torch.Tensor:
-        """
-        Preprocess image(s) for model input.
+        """Convert image to tensor and apply transforms."""
+        if isinstance(image, torch.Tensor):
+            return image
         
-        Args:
-            image: Input image(s) - PIL Image, tensor, or list of PIL Images
-            
-        Returns:
-            Preprocessed tensor [B, C, H, W]
-        """
         if isinstance(image, PIL.Image.Image):
-            image = self.transform(image).unsqueeze(0)  # [1, C, H, W]
-        elif isinstance(image, list):
-            image = torch.stack([self.transform(img) for img in image])
-        elif isinstance(image, torch.Tensor):
-            if image.dim() == 3:
-                image = image.unsqueeze(0)  # Add batch dimension
-        else:
-            raise ValueError(f"Unsupported image type: {type(image)}")
+            return self.transform(image).unsqueeze(0)
         
-        return image.to(self.device)
-
-    def __call__(
-        self, 
-        image: Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]],
-        return_risk_score: bool = True
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Generate attribution heatmap showing which regions affect geolocation risk.
+        if isinstance(image, list):
+            return torch.stack([self.transform(img) for img in image])
         
-        Uses gradient × input attribution: ∂(risk_score)/∂(pixel) × pixel_value
-        Higher values indicate regions that strongly affect localizability.
-        
-        Args:
-            image: Input image(s) - PIL Image, tensor, or list of PIL Images
-            return_risk_score: If True, also return the predicted risk scores
-            
-        Returns:
-            If return_risk_score=False:
-                Attribution heatmap [B, H, W] normalized to [0, 1]
-            If return_risk_score=True:
-                Tuple of (heatmap [B, H, W], risk_scores [B])
-        """
-        # 1. Preprocess image
-        image_tensor = self._preprocess_image(image)
-        batch_size = image_tensor.shape[0]
-        
-        # 2. Enable gradient computation
-        image_tensor.requires_grad = True
-        
-        # 3. Forward pass through model
-        with torch.set_grad_enabled(True):
-            logits = self.model(image_tensor)  # [B]
-            risk_scores = torch.sigmoid(logits)  # Risk probability in [0, 1]
-        
-        # 4. Compute gradients: ∂(risk_score)/∂(image)
-        # We need gradients for each image in the batch
-        self.model.zero_grad()
-        if image_tensor.grad is not None:
-            image_tensor.grad.zero_()
-        
-        # Compute gradients for the entire batch at once
-        risk_scores.sum().backward()
-        
-        # 5. Compute attribution map using Gradient × Input
-        # This gives "effective sensitivity" - which pixels have high gradient AND high values
-        attribution = (image_tensor.grad * image_tensor).abs()  # [B, C, H, W]
-        
-        # Sum over color channels to get spatial attribution
-        attribution = attribution.sum(dim=1)  # [B, H, W]
-        
-        # Detach from computation graph
-        attribution = attribution.detach()
-        
-        # 6. Normalize to [0, 1] per image
-        for i in range(batch_size):
-            attr_min = attribution[i].min()
-            attr_max = attribution[i].max()
-            if attr_max > attr_min:
-                attribution[i] = (attribution[i] - attr_min) / (attr_max - attr_min)
-            else:
-                # If attribution is constant (e.g., all zeros), keep as is
-                attribution[i] = torch.zeros_like(attribution[i])
-        
-        # 7. Optional: Apply Gaussian smoothing to reduce noise
-        if self.smooth_heatmap:
-            attribution = attribution.unsqueeze(1)  # [B, 1, H, W] for gaussian_blur
-            attribution = gaussian_blur(
-                attribution, 
-                kernel_size=self.smooth_kernel_size
-            )
-            attribution = attribution.squeeze(1)  # [B, H, W]
-        
-        # 8. Return heatmap (and optionally risk scores)
-        if return_risk_score:
-            return attribution, risk_scores.detach()
-        else:
-            return attribution
+        raise ValueError(f"Unsupported image type: {type(image)}")
     
-    def integrated_gradients(
-        self,
-        image: Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]],
-        n_steps: int = 50,
-        baseline: Optional[torch.Tensor] = None,
-        return_risk_score: bool = True
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def _extract_attention_maps(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
-        Generate attribution using Integrated Gradients (more stable than plain gradients).
+        Extract attention maps from all transformer blocks.
         
-        Integrated Gradients averages gradients along a path from a baseline image
-        (default: black image) to the actual image. This tends to produce more
-        stable and theoretically grounded attributions.
+        Returns:
+            List of attention tensors, each of shape [batch, heads, tokens, tokens]
+        """
+        attention_maps = []
+        
+        # Hook to capture attention weights
+        def hook_fn(module, input, output):
+            # For DINOv2/ViT, attention weights are computed in the attention module
+            # We need to compute them from the query, key matrices
+            B, N, C = input[0].shape
+            qkv = module.qkv(input[0]).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            
+            attn = (q @ k.transpose(-2, -1)) * module.scale
+            attn = attn.softmax(dim=-1)
+            
+            attention_maps.append(attn.detach())
+        
+        # Register hooks on attention blocks starting from layer 3
+        hooks = []
+        backbone_model = self.model.model.backbone.model
+        start_layer = 3  # Skip layers 0, 1, 2
+        for i, block in enumerate(backbone_model.blocks):
+            if i >= start_layer:
+                hook = block.attn.register_forward_hook(hook_fn)
+                hooks.append(hook)
+        
+        # Forward pass
+        with torch.no_grad():
+            _ = self.model(x)
+        
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+        
+        return attention_maps
+    
+    def _compute_attention_rollout(self, attention_maps: List[torch.Tensor], 
+                                   head_fusion: str = "mean", 
+                                   discard_ratio: float = 0.1) -> torch.Tensor:
+        """
+        Compute attention rollout from layer attention maps.
         
         Args:
-            image: Input image(s) - PIL Image, tensor, or list of PIL Images
-            n_steps: Number of interpolation steps (more = more accurate but slower)
-            baseline: Baseline image to integrate from (default: zeros/black image)
-            return_risk_score: If True, also return the predicted risk scores
+            attention_maps: List of attention tensors [batch, heads, tokens, tokens]
+            head_fusion: How to fuse attention heads
+            discard_ratio: Ratio of lowest attentions to discard
             
         Returns:
-            If return_risk_score=False:
-                Attribution heatmap [B, H, W] normalized to [0, 1]
-            If return_risk_score=True:
-                Tuple of (heatmap [B, H, W], risk_scores [B])
+            Rolled attention of shape [batch, tokens, tokens]
         """
-        # 1. Preprocess image
-        image_tensor = self._preprocess_image(image)
-        batch_size = image_tensor.shape[0]
+        batch_size = attention_maps[0].shape[0]
+        num_tokens = attention_maps[0].shape[-1]
         
-        # 2. Create baseline (default: black image)
-        if baseline is None:
-            baseline = torch.zeros_like(image_tensor)
-        
-        # 3. Generate interpolated images
-        alphas = torch.linspace(0, 1, n_steps, device=self.device)
-        
-        # Collect gradients at each step
-        gradients = []
-        
-        for alpha in alphas:
-            # Interpolate between baseline and image
-            interpolated = baseline + alpha * (image_tensor - baseline)
-            interpolated.requires_grad = True
-            
-            # Forward pass
-            logits = self.model(interpolated)
-            risk_scores = torch.sigmoid(logits)
-            
-            # Backward pass
-            self.model.zero_grad()
-            if interpolated.grad is not None:
-                interpolated.grad.zero_()
-            
-            risk_scores.sum().backward()
-            
-            # Store gradients
-            gradients.append(interpolated.grad.detach())
-        
-        # 4. Average gradients across all interpolation steps
-        avg_gradients = torch.stack(gradients).mean(dim=0)  # [B, C, H, W]
-        
-        # 5. Compute integrated gradients: avg_grad × (image - baseline)
-        attribution = (avg_gradients * (image_tensor - baseline)).abs()  # [B, C, H, W]
-        
-        # Sum over color channels
-        attribution = attribution.sum(dim=1)  # [B, H, W]
-        
-        # 6. Normalize to [0, 1] per image
-        for i in range(batch_size):
-            attr_min = attribution[i].min()
-            attr_max = attribution[i].max()
-            if attr_max > attr_min:
-                attribution[i] = (attribution[i] - attr_min) / (attr_max - attr_min)
+        # Fuse attention heads for each layer
+        fused_attentions = []
+        for attn in attention_maps:
+            if head_fusion == "mean":
+                fused = attn.mean(dim=1)  # [batch, tokens, tokens]
+            elif head_fusion == "max":
+                fused = attn.max(dim=1)[0]
+            elif head_fusion == "min":
+                fused = attn.min(dim=1)[0]
             else:
-                attribution[i] = torch.zeros_like(attribution[i])
+                raise ValueError(f"Unknown head_fusion: {head_fusion}")
+            
+            # Discard lowest attentions for stability
+            if discard_ratio > 0:
+                flat = fused.view(batch_size, -1)
+                threshold = flat.quantile(discard_ratio, dim=-1, keepdim=True)
+                fused = torch.where(
+                    fused < threshold.view(batch_size, 1, 1),
+                    torch.zeros_like(fused),
+                    fused
+                )
+            
+            # Add identity matrix to account for residual connections
+            I = torch.eye(num_tokens, device=fused.device).unsqueeze(0)
+            fused = fused + I
+            
+            # Re-normalize
+            fused = fused / fused.sum(dim=-1, keepdim=True)
+            
+            fused_attentions.append(fused)
         
-        # 7. Optional: Apply smoothing
-        if self.smooth_heatmap:
-            attribution = attribution.unsqueeze(1)
-            attribution = gaussian_blur(attribution, kernel_size=self.smooth_kernel_size)
-            attribution = attribution.squeeze(1)
+        # Recursively multiply attention matrices (rollout)
+        rollout = fused_attentions[0]
+        for attn in fused_attentions[1:]:
+            rollout = torch.matmul(attn, rollout)
         
-        # 8. Get final risk scores
-        with torch.no_grad():
-            final_logits = self.model(image_tensor)
-            final_risk_scores = torch.sigmoid(final_logits)
+        return rollout
+    
+    def _rollout_to_saliency(self, rollout: torch.Tensor, image_size: Tuple[int, int]) -> torch.Tensor:
+        """
+        Convert attention rollout to spatial saliency map.
         
-        if return_risk_score:
-            return attribution, final_risk_scores
-        else:
-            return attribution
+        Args:
+            rollout: Attention rollout [batch, tokens, tokens]
+            image_size: (height, width) of input image
+            
+        Returns:
+            Saliency map [batch, height, width]
+        """
+        # Take attention from CLS token to all patches
+        # CLS token is at index 0
+        cls_attention = rollout[:, 0, 1:]  # [batch, num_patches]
+        
+        # Reshape to spatial grid
+        # For DINOv2/ViT with patch size 14, calculate grid size
+        patch_size = 14
+        h_patches = image_size[0] // patch_size
+        w_patches = image_size[1] // patch_size
+        
+        saliency = cls_attention.view(-1, h_patches, w_patches)
+        
+        # Upsample to image resolution
+        saliency = F.interpolate(
+            saliency.unsqueeze(1),
+            size=image_size,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)
+        
+        # Normalize to [0, 1]
+        saliency = (saliency - saliency.amin(dim=(1, 2), keepdim=True)) / (
+            saliency.amax(dim=(1, 2), keepdim=True) - saliency.amin(dim=(1, 2), keepdim=True) + 1e-8
+        )
+        
+        return saliency
+    

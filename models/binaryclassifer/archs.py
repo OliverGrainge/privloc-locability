@@ -19,70 +19,6 @@ class MLPClassifier(nn.Module):
 
 
 
-class DINOv2(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = timm.create_model(
-            'vit_base_patch14_dinov2.lvd142m',
-            pretrained=True, num_classes=0
-        )
-        for p in self.backbone.parameters():
-            p.requires_grad = True
-
-        self.feat_dim = self.backbone.num_features
-        self.head = MLPClassifier(self.feat_dim)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.encode(x)
-        return self.head(feats)
-
-
-def dino_transform():
-    return transforms.Compose([
-        transforms.Resize(int(518), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(518),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-
-class SigLip(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = timm.create_model(
-            'vit_so400m_patch14_siglip_384',
-            pretrained=True, num_classes=0
-        )
-        for p in self.backbone.parameters():
-            p.requires_grad = True
-
-        self.feat_dim = self.backbone.num_features
-        self.head = MLPClassifier(self.feat_dim)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.encode(x)
-        return self.head(feats)
-
-
-def siglip_transform():
-    """
-    SigLIP uses different normalization than ImageNet models.
-    Mean/std are calculated to map [0, 255] -> [-1, 1].
-    """
-    return transforms.Compose([
-        transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(384),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5])
-    ])
 
 
 class MegaLoc(nn.Module):
@@ -154,11 +90,7 @@ def load_arch_and_transform(arch_name: str, **kwargs):
         (model, transform)
     """
 
-    if arch_name.lower() == 'dinov2':
-        return DINOv2(), dino_transform()
-    elif arch_name.lower() == 'siglip':
-        return SigLip(), siglip_transform()
-    elif arch_name.lower() == 'megaloc':
+    if arch_name.lower() == 'megaloc':
         return MegaLoc(**kwargs), megaloc_transform()
     else:
         raise ValueError(f"Unknown architecture: {arch_name}. Available: dinov2, siglip, megaloc")
