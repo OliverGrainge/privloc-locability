@@ -198,6 +198,19 @@ class GeoAttributionHeatmap:
             align_corners=False
         ).squeeze(1)
         
+        # Remove outliers using percentile-based thresholding
+        # Clip extreme high values to reduce single hotspots
+        batch_size = saliency.shape[0]
+        for i in range(batch_size):
+            sal = saliency[i]
+            # Calculate 95th percentile
+            percentile_98 = torch.quantile(sal.flatten(), 0.98)
+            # Clip values above 95th percentile
+            saliency[i] = torch.clamp(sal, max=percentile_98)
+        
+        # Apply Gaussian smoothing to create more coherent regions
+        saliency = gaussian_blur(saliency.unsqueeze(1), kernel_size=21, sigma=3.0).squeeze(1)
+        
         # Normalize to [0, 1]
         saliency = (saliency - saliency.amin(dim=(1, 2), keepdim=True)) / (
             saliency.amax(dim=(1, 2), keepdim=True) - saliency.amin(dim=(1, 2), keepdim=True) + 1e-8

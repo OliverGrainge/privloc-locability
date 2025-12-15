@@ -1,275 +1,160 @@
-# Geoprivacy Attribution Explanations
+# Explainable AI Models
 
-This module provides gradient-based attribution methods to identify which regions of an image contribute most to geolocation vulnerability.
+This directory contains explainability methods for geolocation models.
 
-## Overview
+## Editable Region Extraction
 
-The `GeoAttributionHeatmap` class computes **∂(risk_score)/∂(image)** to identify spatial regions that most affect whether an image is localizable. This produces heatmaps showing which parts of an image leak location information.
+The `EditableRegionExtraction` class combines **Grounding DINO** (for object detection) with **SAM** (Segment Anything Model) to generate precise segmentation masks based on text labels.
 
-## Quick Start
+### Features
 
-### Basic Usage
+- **Text-based detection**: Detect objects using natural language descriptions
+- **Precise segmentation**: Uses SAM to generate pixel-accurate masks (not just bounding boxes)
+- **Flexible labels**: Supports custom text labels or uses sensible defaults
+- **GPU accelerated**: Automatically uses available GPU via Accelerator
+
+### Usage
+
+#### Basic Usage
 
 ```python
-from models import BinaryClassifier
-from models.explanations import GeoAttributionHeatmap, save_attribution_visualization
+from models.explanations.region import EditableRegionExtraction
 from PIL import Image
 
-# Load trained model
-model = BinaryClassifier.load_from_checkpoint("path/to/checkpoint.ckpt")
-
-# Create attribution system
-attributor = GeoAttributionHeatmap(
-    model=model,
-    transform=model.transform,
-    device="cuda"
+# Initialize the model
+extractor = EditableRegionExtraction(
+    text_labels=["building", "tree", "car", "person"],
+    threshold=0.3,
+    use_sam=True  # Use SAM for precise segmentation
 )
 
-# Load image
-image = Image.open("test_image.jpg")
+# Load an image
+image = Image.open("path/to/image.jpg")
 
-# Generate heatmap
-heatmap, risk_score = attributor(image, return_risk_score=True)
+# Extract masks (returns tensor of shape [N, H, W])
+masks = extractor(image)
 
-# Save visualization
-save_attribution_visualization(
-    image=image,
-    heatmap=heatmap[0],  # Remove batch dimension
-    save_path="attribution.png",
-    risk_score=risk_score[0].item()
+# Or get detailed results with labels and scores
+results = extractor(image, return_dict=True)
+# results = {
+#     'masks': torch.Tensor,      # [N, H, W]
+#     'labels': List[str],        # ['building', 'tree', ...]
+#     'scores': torch.Tensor,     # [N] confidence scores
+#     'image_size': Tuple[int]    # (width, height)
+# }
+```
+
+#### Without SAM (Bounding Box Masks)
+
+If you want faster inference or don't need precise segmentation:
+
+```python
+extractor = EditableRegionExtraction(
+    text_labels=["building", "tree"],
+    use_sam=False  # Use rectangular bounding box masks
+)
+
+masks = extractor(image)
+```
+
+#### Custom Models
+
+You can specify different model variants:
+
+```python
+extractor = EditableRegionExtraction(
+    model_id="IDEA-Research/grounding-dino-base",  # or -tiny, -large
+    sam_model_id="facebook/sam-vit-huge",          # or -base, -large
+    threshold=0.4,
+    text_threshold=0.3
 )
 ```
 
-### Command-Line Demo
+### Command-Line Testing
+
+Test the region extraction on any image:
 
 ```bash
-# Basic usage
-python demo_attribution.py \
-    --checkpoint runs/binaryclassfier/megaloc/checkpoints/best_model.ckpt \
-    --image test_image.jpg
+# With SAM (precise segmentation)
+python scripts/test_region_extraction.py \
+    --image path/to/image.jpg \
+    --output results.png \
+    --labels "building" "tree" "car" "person"
 
-# With custom options
-python demo_attribution.py \
-    --checkpoint path/to/model.ckpt \
-    --image test_image.jpg \
-    --output custom_output.png \
-    --device cuda \
-    --colormap hot \
-    --alpha 0.6 \
-    --method integrated
+# Without SAM (faster, rectangular masks)
+python scripts/test_region_extraction.py \
+    --image path/to/image.jpg \
+    --output results.png \
+    --no_sam
+
+# Adjust detection thresholds
+python scripts/test_region_extraction.py \
+    --image path/to/image.jpg \
+    --threshold 0.2 \
+    --text_threshold 0.2
+
+# Use larger SAM model for better quality
+python scripts/test_region_extraction.py \
+    --image path/to/image.jpg \
+    --sam_model_id facebook/sam-vit-huge
 ```
+
+### Default Labels
+
+If no custom labels are provided, the following defaults are used:
+
+- building
+- tree
+- car
+- person
+- animal
+- plant
+- object
+- sky
+- water
+
+### Parameters
+
+#### `__init__` Parameters
+
+- `text_labels` (Optional[List[str]]): Text descriptions of objects to detect. If None, uses defaults.
+- `model_id` (str): HuggingFace model ID for Grounding DINO. Default: `"IDEA-Research/grounding-dino-tiny"`
+- `sam_model_id` (str): HuggingFace model ID for SAM. Default: `"facebook/sam-vit-base"`
+- `threshold` (float): Detection confidence threshold. Default: `0.4`
+- `text_threshold` (float): Text matching threshold. Default: `0.3`
+- `use_sam` (bool): Whether to use SAM for precise segmentation. Default: `True`
+
+#### `__call__` Parameters
+
+- `image` (Union[torch.Tensor, Image.Image, List[Image.Image]]): Input image(s)
+- `return_dict` (bool): If True, returns dictionary with masks and metadata. If False, returns only masks tensor. Default: `False`
+
+### Model Comparison
+
+| Feature | Without SAM | With SAM |
+|---------|-------------|----------|
+| Mask Type | Rectangular boxes | Precise object contours |
+| Speed | Fast (~100ms) | Slower (~500ms) |
+| Accuracy | Approximate | High precision |
+| GPU Memory | Low | Higher |
+| Use Case | Quick prototyping | Production, analysis |
+
+### Performance Tips
+
+1. **Use smaller models for speed**: `grounding-dino-tiny` + `sam-vit-base`
+2. **Use larger models for quality**: `grounding-dino-base` + `sam-vit-huge`
+3. **Disable SAM for quick testing**: Set `use_sam=False`
+4. **Adjust thresholds**: Lower thresholds detect more (but with more false positives)
+5. **Batch processing**: Currently processes one image at a time
+
+### How It Works
+
+1. **Grounding DINO** detects objects based on text labels and returns bounding boxes
+2. **SAM** (if enabled) takes each bounding box as a prompt and generates precise segmentation masks
+3. The output is a tensor of binary masks where each mask corresponds to one detected region
+
+This approach combines the flexibility of text-based detection with the precision of state-of-the-art segmentation.
 
 ## Attribution Methods
 
-### 1. Gradient × Input (Default)
-
-Fast, single forward/backward pass:
-
-```python
-heatmap, risk_score = attributor(image)
-```
-
-- **Speed**: ~0.1s per image on GPU
-- **Use case**: Quick exploration, batch processing
-- **Formula**: `∂(risk)/∂(pixel) × pixel_value`
-
-### 2. Integrated Gradients
-
-More stable, averages gradients along path from black image to actual image:
-
-```python
-heatmap, risk_score = attributor.integrated_gradients(
-    image, 
-    n_steps=50
-)
-```
-
-- **Speed**: ~5s per image on GPU (50 steps)
-- **Use case**: Publication-quality figures, when you need more stable attributions
-- **Formula**: `avg_gradients × (image - baseline)`
-
-## API Reference
-
-### `GeoAttributionHeatmap`
-
-**Constructor:**
-
-```python
-GeoAttributionHeatmap(
-    model,              # Trained BinaryClassifier
-    transform,          # Image preprocessing transform
-    device="cpu",       # Device to run on
-    smooth_heatmap=True,  # Apply Gaussian smoothing
-    smooth_kernel_size=15  # Smoothing kernel size
-)
-```
-
-**Methods:**
-
-- `__call__(image, return_risk_score=True)` - Generate gradient attribution
-- `integrated_gradients(image, n_steps=50, return_risk_score=True)` - Generate integrated gradients attribution
-
-**Returns:**
-- If `return_risk_score=True`: `(heatmap [B, H, W], risk_scores [B])`
-- If `return_risk_score=False`: `heatmap [B, H, W]`
-
-### Visualization Functions
-
-**`save_attribution_visualization`**
-```python
-save_attribution_visualization(
-    image,           # Original image
-    heatmap,         # Attribution map [H, W]
-    save_path,       # Output file path
-    risk_score=None, # Optional risk score
-    colormap='jet',  # Heatmap colormap
-    alpha=0.5,       # Overlay transparency
-    dpi=150          # Output resolution
-)
-```
-
-**`create_attribution_figure`**
-```python
-fig = create_attribution_figure(
-    image, heatmap, risk_score=None, 
-    title=None, colormap='jet', alpha=0.5
-)
-```
-Returns matplotlib Figure with 3 panels: original, heatmap, overlay
-
-**`overlay_heatmap_on_image`**
-```python
-overlaid_image = overlay_heatmap_on_image(
-    image, heatmap, alpha=0.5, 
-    colormap='jet', return_pil=True
-)
-```
-
-**`highlight_top_regions`**
-```python
-highlighted = highlight_top_regions(
-    image, heatmap, top_k_percent=10.0,
-    highlight_color=(255, 0, 0), alpha=0.3
-)
-```
-
-## Interpreting Results
-
-### Risk Score
-- **Range**: [0, 1]
-- **Meaning**: Probability that geolocation error ≤ threshold_km
-- **High score** (e.g., 0.8): Image is likely localizable within threshold
-- **Low score** (e.g., 0.2): Image is likely NOT localizable within threshold
-
-### Heatmap
-- **Red/Hot regions**: High attribution - strongly affect localizability
-- **Blue/Cool regions**: Low attribution - less important for localization
-- **Normalized**: Values are relative within each image
-
-### What Makes Regions "Risky"?
-Common high-attribution regions:
-- Distinctive landmarks (buildings, monuments)
-- Text/signs (street signs, storefront names)
-- Geographic features (mountains, coastlines)
-- Architectural styles (region-specific)
-- Vegetation patterns
-
-## Advanced Usage
-
-### Batch Processing
-
-```python
-# Process multiple images
-images = [Image.open(f"img{i}.jpg") for i in range(10)]
-heatmaps, risk_scores = attributor(images, return_risk_score=True)
-
-# Save all
-for i, (img, hmap, score) in enumerate(zip(images, heatmaps, risk_scores)):
-    save_attribution_visualization(
-        img, hmap, f"output_{i}.png", 
-        risk_score=score.item()
-    )
-```
-
-### Comparison Visualization
-
-```python
-from models.explanations import create_comparison_figure
-
-fig = create_comparison_figure(
-    images=[img1, img2, img3],
-    heatmaps=[hmap1, hmap2, hmap3],
-    risk_scores=[score1, score2, score3]
-)
-fig.savefig("comparison.png", dpi=150, bbox_inches='tight')
-```
-
-### Extract Top Regions
-
-```python
-from models.explanations import get_top_regions_mask, highlight_top_regions
-
-# Get binary mask of top 10% regions
-mask = get_top_regions_mask(heatmap, top_k_percent=10.0)
-
-# Highlight them in red
-highlighted = highlight_top_regions(
-    image, heatmap, top_k_percent=10.0,
-    highlight_color=(255, 0, 0)
-)
-highlighted.save("highlighted.png")
-```
-
-## Technical Details
-
-### DINOv2 Architecture Specifics
-
-The attribution method is optimized for Vision Transformer architectures:
-
-- **Patch-based**: DINOv2 operates on 14×14 patches, but gradients backpropagate to pixels
-- **Input size**: 518×518 (from your model's transform)
-- **Output size**: Heatmap is same size as input (518×518)
-- **Smoothing**: Applied to reduce patch boundary artifacts
-
-### Memory Usage
-
-- **Gradient method**: ~2GB GPU memory per image (518×518)
-- **Integrated gradients**: ~2GB × n_steps (can be high)
-- **Batch processing**: Linear scaling with batch size
-
-### Performance
-
-On NVIDIA A100:
-- Gradient attribution: ~0.1s per image
-- Integrated gradients (50 steps): ~5s per image
-
-## Troubleshooting
-
-**Issue**: Heatmap is too noisy
-- **Solution**: Enable smoothing (default) or increase `smooth_kernel_size`
-
-**Issue**: Heatmap shows patch grid patterns
-- **Solution**: This is normal for ViT models; use smoothing to reduce
-
-**Issue**: All regions have similar attribution
-- **Solution**: Image may have uniform risk; check risk_score - if very low/high, the model is confident
-
-**Issue**: Out of memory
-- **Solution**: Reduce batch size or use smaller images
-
-## Citation
-
-If you use this attribution method in your research, please cite:
-
-```bibtex
-@inproceedings{yourpaper2025,
-  title={Localized Geoprivacy Explanations: Identifying Image Regions that Contribute to Geolocation Vulnerability},
-  author={Your Name},
-  booktitle={Conference},
-  year={2025}
-}
-```
-
-## License
-
-Same as parent project.
+See `attribution.py` for attention-based attribution methods like Attention Rollout.

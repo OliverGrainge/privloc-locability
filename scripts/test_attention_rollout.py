@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument(
         '--checkpoint',
         type=str,
-        required=True,
+        default='/home/oeg1n18/privloc-locability/runs/binaryclassfier/megaloc/checkpoints/best_model.ckpt',
         help='Path to model checkpoint (.ckpt file)'
     )
     parser.add_argument(
@@ -170,11 +170,15 @@ def visualize_attention(
     plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
     
     # 3. Overlay on original image
+    # Resize saliency to match original image size for better quality overlay
+    from PIL import Image as PILImage
+    saliency_resized = np.array(
+        PILImage.fromarray((saliency_np * 255).astype(np.uint8)).resize(
+            image.size, PILImage.BILINEAR
+        )
+    ) / 255.0
     axes[2].imshow(image)
-    # Resize image to match saliency size for overlay
-    image_resized = np.array(image.resize((saliency_np.shape[1], saliency_np.shape[0])))
-    axes[2].imshow(image_resized)
-    axes[2].imshow(saliency_np, cmap=colormap, alpha=alpha)
+    axes[2].imshow(saliency_resized, cmap=colormap, alpha=alpha)
     axes[2].set_title('Overlay', fontsize=14, fontweight='bold')
     axes[2].axis('off')
     
